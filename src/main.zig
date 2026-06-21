@@ -84,8 +84,22 @@ pub fn loadSuperBlock(db: std.Io.File) !SuperBlock {
     return super;
 }
 
+pub fn writeSuperBlock(db: std.Io.File, super: *const SuperBlock) !void {
+    if (super.magic != SuperBlock.Magic) {
+        return error.InvalidMagicNumber;
+    }
+
+    var copy: SuperBlock = super.*;
+    copy.nativeToEndian();
+
+    const iovec: []const std.posix.iovec_const = &.{
+        .{ .base = @ptrCast(&copy), .len = @sizeOf(SuperBlock) },
+    };
+    _ = try stdx.pwritev(db.handle, &iovec, 0);
+}
+
 pub fn setKey(db: std.Io.File, key: []const u8, value: []const u8) !void {
-    const super = try loadSuperBlock(db);
+    var super = try loadSuperBlock(db);
 
     const key_len: usize = key.len;
     const val_len: usize = value.len;
@@ -98,4 +112,7 @@ pub fn setKey(db: std.Io.File, key: []const u8, value: []const u8) !void {
         .{ .base = value.ptr, .len = val_len },
     };
     _ = try stdx.pwritev(db.handle, &iovec, super.free_offset);
+
+    super.free_offset += key_len + val_len + (@sizeOf(usize) * 2);
+    try writeSuperBlock(db, &super);
 }
