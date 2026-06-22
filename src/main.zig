@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const stdx = @import("stdx.zig");
 
 const Io = std.Io;
@@ -34,6 +35,12 @@ const Session = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    comptime {
+        if (builtin.cpu.arch.endian() != .little) {
+            @compileError("Big endian architectures are not supported");
+        }
+    }
+
     const gpa = init.gpa;
     const cwd = std.Io.Dir.cwd();
 
@@ -59,7 +66,6 @@ pub fn createDatabase(io: std.Io, cwd: std.Io.Dir, path: []const u8) !std.Io.Fil
     var super = SuperBlock{
         .free_offset = @sizeOf(SuperBlock),
     };
-    super.nativeToEndian();
 
     try file.writePositionalAll(io, std.mem.asBytes(&super), 0);
 
@@ -72,38 +78,11 @@ const SuperBlock = extern struct {
     magic: u64 = Magic,
     count: u64 = 0, // total number of keys
     free_offset: u64 = 0, // offset for next free spot
-
-    pub fn endianToNative(self: *SuperBlock) void {
-        const info = @typeInfo(SuperBlock);
-        inline for (info.@"struct".fields) |field| {
-            switch (@typeInfo(field.type)) {
-                .int => {
-                    @field(self, field.name) = std.mem.littleToNative(field.type, @field(self, field.name));
-                },
-                .float => @compileError("floats are not supported in SuperBlock"),
-                else => {},
-            }
-        }
-    }
-
-    pub fn nativeToEndian(self: *SuperBlock) void {
-        const info = @typeInfo(SuperBlock);
-        inline for (info.@"struct".fields) |field| {
-            switch (@typeInfo(field.type)) {
-                .int => {
-                    @field(self, field.name) = std.mem.nativeToLittle(field.type, @field(self, field.name));
-                },
-                .float => @compileError("floats are not supported in SuperBlock"),
-                else => {},
-            }
-        }
-    }
 };
 
 pub fn loadSuperBlock(db: std.Io.File) !SuperBlock {
     var super: SuperBlock = undefined;
     _ = try stdx.pread(db.handle, std.mem.asBytes(&super), 0);
-    super.endianToNative();
 
     if (super.magic != SuperBlock.Magic) {
         return error.InvalidMagicNumber;
@@ -117,11 +96,8 @@ pub fn writeSuperBlock(db: std.Io.File, super: *const SuperBlock) !void {
         return error.InvalidMagicNumber;
     }
 
-    var copy: SuperBlock = super.*;
-    copy.nativeToEndian();
-
     const iovec: []const std.posix.iovec_const = &.{
-        .{ .base = @ptrCast(&copy), .len = @sizeOf(SuperBlock) },
+        .{ .base = std.mem.asBytes(super), .len = @sizeOf(SuperBlock) },
     };
     _ = try stdx.pwritev(db.handle, &iovec, 0);
 }
