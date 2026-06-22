@@ -7,6 +7,28 @@ const native_os = std.posix.ReadError;
 const errno = std.posix.errno;
 const unexpectedErrno = std.posix.unexpectedErrno;
 
+/// Converts an array of pointers/slices into an `iovec`
+pub fn asIoVec(buffers: anytype) [buffers.len]std.posix.iovec_const {
+    var iovecs: [buffers.len]std.posix.iovec_const = undefined;
+    inline for (buffers, 0..) |buf, idx| {
+        const info = @typeInfo(@TypeOf(buf));
+        if (info == .pointer and info.pointer.size == .one) {
+            iovecs[idx] = .{
+                .base = @ptrCast(buf),
+                .len = @sizeOf(info.pointer.child),
+            };
+        } else if (info == .pointer and info.pointer.size == .slice) {
+            iovecs[idx] = .{
+                .base = buf.ptr,
+                .len = buf.len,
+            };
+        } else {
+            @compileError("un-handled type: " ++ @typeName(@TypeOf(buf)));
+        }
+    }
+    return iovecs;
+}
+
 pub fn pread(fd: fd_t, buf: []u8, offset: usize) ReadError!usize {
     if (buf.len == 0) return 0;
 
@@ -58,7 +80,7 @@ pub fn pwrite(fd: fd_t, buf: []u8, offset: usize) ReadError!usize {
     }
 }
 
-pub fn pwritev(fd: fd_t, iovec: *const []const std.posix.iovec_const, offset: usize) ReadError!usize {
+pub fn pwritev(fd: fd_t, iovec: []const std.posix.iovec_const, offset: usize) ReadError!usize {
     while (true) {
         const rc = std.os.linux.pwritev(fd, iovec.ptr, iovec.len, @intCast(offset));
         switch (errno(rc)) {

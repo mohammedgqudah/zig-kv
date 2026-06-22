@@ -96,10 +96,7 @@ pub fn writeSuperBlock(db: std.Io.File, super: *const SuperBlock) !void {
         return error.InvalidMagicNumber;
     }
 
-    const iovec: []const std.posix.iovec_const = &.{
-        .{ .base = std.mem.asBytes(super), .len = @sizeOf(SuperBlock) },
-    };
-    _ = try stdx.pwritev(db.handle, &iovec, 0);
+    _ = try stdx.pwritev(db.handle, &stdx.asIoVec(.{super}), 0);
 }
 
 pub fn setKey(session: *Session, key: []const u8, value: []const u8) !void {
@@ -108,15 +105,14 @@ pub fn setKey(session: *Session, key: []const u8, value: []const u8) !void {
     const key_len: usize = key.len;
     const val_len: usize = value.len;
     // -----------------------------------
-    // key_size | value_size | key | value
+    // key_len | value_len | key | value
     // -----------------------------------
-    const iovec: []const std.posix.iovec_const = &.{
-        .{ .base = @ptrCast(&key_len), .len = @sizeOf(usize) },
-        .{ .base = @ptrCast(&val_len), .len = @sizeOf(usize) },
-
-        .{ .base = key.ptr, .len = key_len },
-        .{ .base = value.ptr, .len = val_len },
-    };
+    const iovec = stdx.asIoVec(.{
+        &key_len,
+        &val_len,
+        key,
+        value,
+    });
     _ = try stdx.pwritev(session.db_file.handle, &iovec, super.free_offset);
 
     super.free_offset += key_len + val_len + (@sizeOf(usize) * 2);
@@ -126,6 +122,7 @@ pub fn setKey(session: *Session, key: []const u8, value: []const u8) !void {
 pub fn getKey(session: *const Session, key: []const u8) !?[]const u8 {
     var offset: usize = @sizeOf(SuperBlock);
     var buffer: [0x1000]u8 = undefined;
+
     while (true) {
         if (try stdx.pread(session.db_file.handle, &buffer, offset) == 0) {
             break;
