@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const fd_t = std.posix.system.fd_t;
 const ReadError = std.posix.ReadError;
@@ -76,4 +77,17 @@ pub fn pwritev(fd: fd_t, iovec: *const []const std.posix.iovec_const, offset: us
             else => |err| return unexpectedErrno(err),
         }
     }
+}
+
+pub fn xxd(io: std.Io, buffer: []const u8) !void {
+    std.debug.assert(builtin.mode == .Debug);
+
+    const child = try std.process.spawn(io, .{
+        .argv = &(.{"xxd"} ++ .{
+            "-c", "8",
+        }),
+        .stdin = .pipe,
+    });
+    try child.stdin.?.writeStreamingAll(io, buffer);
+    child.stdin.?.close(io);
 }

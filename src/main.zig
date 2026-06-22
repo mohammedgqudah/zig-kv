@@ -2,10 +2,13 @@ const std = @import("std");
 const stdx = @import("stdx.zig");
 
 const Io = std.Io;
+const assert = std.debug.assert;
+const mem = std.mem;
 
 const zig_simple_kv = @import("zig_simple_kv");
 
 pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
     const cwd = std.Io.Dir.cwd();
     const db = try blk: {
         if (cwd.openFile(init.io, "db.z", .{ .mode = .read_write })) |f| {
@@ -20,6 +23,14 @@ pub fn main(init: std.process.Init) !void {
     };
 
     _ = try setKey(db, "abc", "123");
+    //_ = try setKey(db, "abc", "555");
+    //_ = try setKey(db, "hello", "AAA");
+
+    const val = try getKey(gpa, db, "abc") orelse unreachable;
+    defer gpa.free(val);
+
+    assert(mem.eql(u8, val, "123"));
+    //assert(mem.eql(u8, try getKey(gpa, db, "hello") orelse unreachable, "AAA"));
 }
 
 pub fn createDatabase(io: std.Io, cwd: std.Io.Dir) !std.Io.File {
@@ -103,16 +114,46 @@ pub fn setKey(db: std.Io.File, key: []const u8, value: []const u8) !void {
 
     const key_len: usize = key.len;
     const val_len: usize = value.len;
-    // write key and value in Pascal format
+    // -----------------------------------
+    // key_size | value_size | key | value
+    // -----------------------------------
     const iovec: []const std.posix.iovec_const = &.{
         .{ .base = @ptrCast(&key_len), .len = @sizeOf(usize) },
-        .{ .base = key.ptr, .len = key_len },
-
         .{ .base = @ptrCast(&val_len), .len = @sizeOf(usize) },
+
+        .{ .base = key.ptr, .len = key_len },
         .{ .base = value.ptr, .len = val_len },
     };
     _ = try stdx.pwritev(db.handle, &iovec, super.free_offset);
 
     super.free_offset += key_len + val_len + (@sizeOf(usize) * 2);
     try writeSuperBlock(db, &super);
+}
+
+pub fn getKey(allocator: std.mem.Allocator, db: std.Io.File, key: []const u8) !?[]const u8 {
+    const super = try loadSuperBlock(db);
+    _ = super;
+
+    var offset: usize = @sizeOf(SuperBlock);
+    var buffer: [0x1000]u8 = undefined;
+    while (true) {
+        if (try stdx.pread(db.handle, &buffer, offset) == 0) {
+            break;
+        }
+
+        const key_start = @sizeOf(usize) * 2;
+        const key_size = std.mem.readInt(usize, buffer[0..8], .little);
+        const value_size = std.mem.readInt(usize, buffer[8..16], .little);
+        const value_start = key_start + key_size;
+        const cand_key = buffer[key_start .. key_start + key_size];
+        if (std.mem.eql(u8, cand_key, key)) {
+            const cand_value = buffer[value_start .. value_start + value_size];
+            std.log.info("found", .{});
+            const ret = try allocator.alloc(u8, cand_value.len);
+            @memcpy(ret, cand_value);
+            return ret;
+        }
+        offset += key_start + key_size + value_size;
+    }
+    return null;
 }
