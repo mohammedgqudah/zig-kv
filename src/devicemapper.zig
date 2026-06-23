@@ -56,6 +56,11 @@ pub const CreateDeviceOptions = struct {
     uuid: ?[c.DM_UUID_LEN]u8 = null,
 };
 
+pub const RemoveDeviceOptions = struct {
+    name: []const u8,
+    uuid: ?[c.DM_UUID_LEN]u8 = null,
+};
+
 /// A device mapper target
 pub const Target = struct {
     pub const Type = enum {
@@ -143,6 +148,39 @@ pub const Mapper = struct {
 
         std.debug.print("device: {any}", .{dm_ioctl.dev});
         return .{ .dev = dm_ioctl.dev };
+    }
+
+    pub fn remove_dev(self: *const Mapper, options: RemoveDeviceOptions) !void {
+        if (options.uuid != null) {
+            @panic("unhandled");
+        }
+
+        var dm_ioctl = c.dm_ioctl{
+            .version = version,
+            .dev = 0,
+            .name = std.mem.zeroes([c.DM_NAME_LEN]u8),
+            .uuid = std.mem.zeroes([c.DM_UUID_LEN]u8),
+            .data_size = @sizeOf(c.dm_ioctl),
+        };
+        @memcpy(dm_ioctl.name[0..options.name.len], options.name);
+
+        const rc = ioctl(
+            self.ctrl_file.handle,
+            c.DM_DEV_REMOVE,
+            @intFromPtr(&dm_ioctl),
+        );
+        switch (rc) {
+            .SUCCESS => {},
+            .NXIO => {
+                // NXIO could also occur if both name and dev were passed
+                // lookup in the kernel is done by `__find_device_hash_cell`
+                return error.DeviceNotFound;
+            },
+            else => {
+                std.log.err("failed to remove device: {s}", .{@tagName(rc)});
+                return std.posix.unexpectedErrno(rc);
+            },
+        }
     }
 
     /// Load a table into the `inactive` slot of the device.

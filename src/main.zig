@@ -49,6 +49,9 @@ pub fn main(init: std.process.Init) !void {
     defer dm.deinit(init.io);
 
     const device = try dm.create_dev(.{ .name = "zerr10" });
+    defer dm.remove_dev(.{ .name = "zerr10" }) catch |err| {
+        std.log.err("failed to remove device: {}", .{err});
+    };
     try dm.load_table(gpa, &device, &.{
         .{ .length = 50, .type = .linear, .params = "/dev/nvme0n1p3 0" },
         .{ .length = 10, .type = .@"error" },
