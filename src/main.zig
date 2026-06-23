@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const stdx = @import("stdx.zig");
+const devmapper = @import("devicemapper.zig");
 
 const Io = std.Io;
 const assert = std.debug.assert;
@@ -43,6 +44,15 @@ pub fn main(init: std.process.Init) !void {
 
     const gpa = init.gpa;
     const cwd = std.Io.Dir.cwd();
+
+    const dm = try devmapper.Mapper.open(init.io);
+    defer dm.deinit(init.io);
+
+    const device = try dm.create_dev(.{ .name = "zerr10" });
+    try dm.load_table(gpa, &device, &.{
+        .{ .length = 50, .type = .linear, .params = "/dev/nvme0n1p3 0" },
+        .{ .length = 10, .type = .@"error" },
+    });
 
     var session = try Session.open(init.io, gpa, cwd, "db.z");
     _ = try setKey(&session, "abc", "123");

@@ -8,6 +8,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/c.h"),
+        .target = target,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+
+    const translate_c_module = translate_c.createModule();
+    translate_c_module.optimize = optimize;
+
     const exe = b.addExecutable(.{
         .name = "zig_simple_kv",
         .root_module = b.createModule(.{
@@ -16,6 +26,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zig_simple_kv", .module = mod },
+                .{ .name = "c", .module = translate_c_module },
             },
         }),
     });
