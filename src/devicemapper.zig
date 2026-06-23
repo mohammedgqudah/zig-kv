@@ -252,17 +252,17 @@ pub const Mapper = struct {
                 next += param_size;
             }
 
-            dm_target_spec.sector_start = sector_start;
-            dm_target_spec.length = target.length;
-
             const target_type_name = @tagName(target.type);
             if (target_type_name.len >= c.DM_MAX_TYPE_NAME) unreachable;
 
+            dm_target_spec.* = .{
+                .sector_start = sector_start,
+                .length = target.length,
+                .target_type = std.mem.zeroes([c.DM_MAX_TYPE_NAME]u8),
+                // `next` is relative to the current target spec struct
+                .next = if (idx == targets.len - 1) 0 else next,
+            };
             @memcpy(dm_target_spec.target_type[0..target_type_name.len], target_type_name);
-            dm_target_spec.target_type[target_type_name.len] = 0;
-
-            // `next` is relative to the current target spec struct
-            dm_target_spec.next = if (idx == targets.len - 1) 0 else next;
 
             sector_start += target.length;
         }
