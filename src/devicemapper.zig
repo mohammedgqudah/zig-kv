@@ -6,6 +6,11 @@
 /// * sudo dmsetup table  <dev_name>                    # show active table for device
 /// * sudo dmsetup remove  <dev_name>                   # remove dm device
 /// * sudo dmsetup ls                                   # list all dm devices
+///
+///
+/// TODO:
+///     * implement suspend/resume so i can make tables active
+///     * accept dm flags in the functions
 const std = @import("std");
 const c = @import("c");
 
