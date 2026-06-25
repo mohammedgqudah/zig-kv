@@ -45,17 +45,17 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const cwd = std.Io.Dir.cwd();
 
-    const dm = try devmapper.Mapper.open(init.io);
-    defer dm.deinit(init.io);
+    //const dm = try devmapper.Mapper.open(init.io);
+    //defer dm.deinit(init.io);
 
-    const device = try dm.create_dev(.{ .name = "zerr10" });
-    defer dm.remove_dev(.{ .name = "zerr10" }) catch |err| {
-        std.log.err("failed to remove device: {}", .{err});
-    };
-    try dm.load_table(gpa, &device, &.{
-        .{ .length = 50, .type = .linear, .params = "/dev/nvme0n1p3 0" },
-        .{ .length = 10, .type = .@"error" },
-    });
+    //const device = try dm.create_dev(.{ .name = "zerr10" });
+    //defer dm.remove_dev(.{ .name = "zerr10" }) catch |err| {
+    //    std.log.err("failed to remove device: {}", .{err});
+    //};
+    //try dm.load_table(gpa, &device, &.{
+    //    .{ .length = 50, .type = .linear, .params = "/dev/nvme0n1p3 0" },
+    //    .{ .length = 10, .type = .@"error" },
+    //});
 
     var session = try Session.open(init.io, gpa, cwd, "db.z");
     _ = try setKey(&session, "abc", "123");
@@ -130,6 +130,7 @@ pub fn setKey(session: *Session, key: []const u8, value: []const u8) !void {
 
     super.free_offset += key_len + val_len + (@sizeOf(usize) * 2);
     try writeSuperBlock(session.db_file, &super);
+    try std.posix.fdatasync(session.db_file.handle);
 }
 
 pub fn getKey(session: *const Session, key: []const u8) !?[]const u8 {
