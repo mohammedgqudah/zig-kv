@@ -104,12 +104,16 @@ pub fn pwritev(fd: fd_t, iovec: []const std.posix.iovec_const, offset: usize) Re
 pub fn xxd(io: std.Io, buffer: []const u8) !void {
     std.debug.assert(builtin.mode == .Debug);
 
-    const child = try std.process.spawn(io, .{
+    var child = try std.process.spawn(io, .{
         .argv = &(.{"xxd"} ++ .{
             "-c", "8",
         }),
         .stdin = .pipe,
     });
-    try child.stdin.?.writeStreamingAll(io, buffer);
-    child.stdin.?.close(io);
+    const stdin = child.stdin.?;
+    try stdin.writeStreamingAll(io, buffer);
+    stdin.close(io);
+    // set to null so child.wait wouldn't panic trying to close it again
+    child.stdin = null;
+    _ = try child.wait(io);
 }
