@@ -102,7 +102,9 @@ pub fn pwritev(fd: fd_t, iovec: []const std.posix.iovec_const, offset: usize) Re
 }
 
 pub fn xxd(io: std.Io, buffer: []const u8) !void {
-    std.debug.assert(builtin.mode == .Debug);
+    if(builtin.mode == .Debug) {
+        @compileError("can't use xxd in release mode");
+    }
 
     var child = try std.process.spawn(io, .{
         .argv = &(.{"xxd"} ++ .{
