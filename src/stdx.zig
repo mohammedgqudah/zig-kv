@@ -57,29 +57,6 @@ pub fn pread(fd: fd_t, buf: []u8, offset: usize) ReadError!usize {
     }
 }
 
-pub fn pwrite(fd: fd_t, buf: []u8, offset: usize) ReadError!usize {
-    if (buf.len == 0) return 0;
-
-    while (true) {
-        const rc = std.os.linux.pread(fd, buf.ptr, buf.len, @intCast(offset));
-        switch (errno(rc)) {
-            .SUCCESS => return @intCast(rc),
-            .INTR => continue,
-            .INVAL => error.InvalidValue,
-            .FAULT => unreachable,
-            .AGAIN => return error.WouldBlock,
-            .CANCELED => return error.Canceled,
-            .BADF => return error.Unexpected,
-            .IO => return error.InputOutput,
-            .ISDIR => return error.IsDir,
-            .NOBUFS => return error.SystemResources,
-            .NOMEM => return error.SystemResources,
-            .TIMEDOUT => return error.Unexpected,
-            else => |err| return unexpectedErrno(err),
-        }
-    }
-}
-
 pub fn pwritev(fd: fd_t, iovec: []const std.posix.iovec_const, offset: usize) ReadError!usize {
     while (true) {
         const rc = std.os.linux.pwritev(fd, iovec.ptr, iovec.len, @intCast(offset));
@@ -102,7 +79,7 @@ pub fn pwritev(fd: fd_t, iovec: []const std.posix.iovec_const, offset: usize) Re
 }
 
 pub fn xxd(io: std.Io, buffer: []const u8) !void {
-    if(builtin.mode == .Debug) {
+    if(builtin.mode == .debug and !builtin.is_test) {
         @compileError("can't use xxd in release mode");
     }
 

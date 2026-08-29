@@ -7,4 +7,4 @@ hooks:
 # this clears the terminal on every change, less noisy.
 .PHONY: dev
 dev:
-	watchexec -e zig -- "clear && zig build"
+	watchexec -e zig -- "clear && zig build test"

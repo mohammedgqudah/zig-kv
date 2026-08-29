@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const stdx = @import("stdx.zig");
 const devmapper = @import("devicemapper.zig");
+const page = @import("page.zig");
 
 const Io = std.Io;
 const assert = std.debug.assert;
@@ -157,4 +158,10 @@ pub fn getKey(session: *const Session, key: []const u8) !?[]const u8 {
         offset += key_start + key_size + value_size;
     }
     return null;
+}
+
+test {
+    std.testing.refAllDecls(devmapper);
+    std.testing.refAllDecls(stdx);
+    std.testing.refAllDecls(page);
 }
