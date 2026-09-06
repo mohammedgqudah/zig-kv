@@ -319,6 +319,7 @@ pub const Tree = struct {
         }
         page.header().number_of_cells += 1;
         page.header().upper -= expected_size;
+        page.header().lower += @sizeOf(CellOffset);
         page.pointers()[insert_idx] = page.header().upper;
         var cell: Cell = .raw(page.inner[page.header().upper..].ptr);
         cell.from_keyval(key, value);
@@ -342,8 +343,9 @@ pub const Tree = struct {
 test "it finds keys in a leaf root node" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    Io.Dir.cwd().deleteFile(io, "./test2.tree") catch {};
-    const file = try Io.Dir.cwd().createFile(io, "./test2.tree", .{ .read = true });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
     var buf: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
     var test_cell: [48]u8 = undefined;
@@ -383,10 +385,9 @@ test "it finds keys in a leaf root node" {
 // [1, 2] [3, 4]  [5, 6]  [7, 8]    [9, 10]     page = 3, 4, 5, 6, 7
 test "some tree" {
     const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    _ = gpa;
-    Io.Dir.cwd().deleteFile(io, "./test3.tree") catch {};
-    const file = try Io.Dir.cwd().createFile(io, "./test3.tree", .{ .read = true });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
     var buf: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
     var test_cell: [48]u8 = undefined;
@@ -546,10 +547,9 @@ test "some tree" {
 
 test {
     const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    _ = gpa;
-    Io.Dir.cwd().deleteFile(io, "./test4.tree") catch {};
-    const file = try Io.Dir.cwd().createFile(io, "./test4.tree", .{ .read = true });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
     var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
 
@@ -573,6 +573,34 @@ test {
     try std.testing.expectEqualStrings("two", result.cell.?.val());
     result = try tree.find("3", &storage);
     try std.testing.expectEqualStrings("three", result.cell.?.val());
+
+    try expectValidTree(&tree);
+}
+
+test "insert random keys" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
+
+    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
+
+    var root: PageBuffer = .new(&storage);
+    root.header().* = .empty(.leaf);
+    try file.writePositionalAll(io, &storage, 0);
+
+    storage = undefined;
+    var tree: Tree = .load(io, file);
+
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const random = prng.random();
+
+    for (0..100) |_| {
+        var key: [10]u8 = undefined;
+        random.bytes(&key);
+        try tree.insert(&key, "one", &storage);
+        try file.writePositionalAll(io, &storage, 0);
+    }
 
     try expectValidTree(&tree);
 }
