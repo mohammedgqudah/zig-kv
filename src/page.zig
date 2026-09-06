@@ -326,19 +326,114 @@ pub const Tree = struct {
     }
 };
 
-// insert
-// delete
-// update
-// find
-//test {
-//    const io = std.testing.io;
-//    Io.Dir.cwd().deleteFile(io, "./test.tree") catch {};
-//    const file = try Io.Dir.cwd().createFile(io, "./test.tree", .{ .read = true });
-//
-//    var tree: Tree = try .empty(io, file);
-//    try tree.find("xyz", "abc");
-//    //try tree.insert("hello", "abc2");
-//}
+const validPageResult = struct {
+    max_key: []u8,
+};
+
+/// Validate a b+tree and check its invariants.
+pub fn expectValidTree(tree: *Tree) !void {
+    if (!builtin.is_test) @compileError("expectValidTree is only allowed in testing");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    _ = try expectValidTreeNode(allocator, tree, tree.root_page_id);
+}
+
+pub fn expectValidTreeNode(
+    allocator: mem.Allocator,
+    tree: *Tree,
+    page_id: PageId,
+) !validPageResult {
+    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
+
+    const n = try tree.file.readPositionalAll(tree.io, &storage, page_id * page_size);
+    if (n != page_size)
+        return error.InvalidNode;
+    var page: PageBuffer = .new(&storage);
+
+    // 1. root.pointers() is sorted
+    // 2. max_key(child[N]) < key[N]
+    assert(page.header().magic == page_magic);
+    var prev_off = page.pointers()[0];
+    for (page.pointers(), 0..) |offset, idx| {
+        assert(offset < page_size);
+        var prev_cell = page.cell(prev_off);
+        var current_cell = page.cell(offset);
+        switch (mem.order(u8, current_cell.key(), prev_cell.key())) {
+            .lt => {
+                std.debug.print(
+                    "invalid node: page {d}, pointer {d}: keys are out of order\n" ++
+                        "  previous key: {s}\n" ++
+                        "  current key:  {s}\n",
+                    .{
+                        page_id,
+                        idx,
+                        prev_cell.key(),
+                        current_cell.key(),
+                    },
+                );
+                return error.InvalidPointers;
+            },
+            else => {},
+        }
+        prev_off = offset;
+    }
+
+    var greatest_cell = page.cell(page.pointers()[page.pointers().len - 1]);
+
+    if (page.header().type == .internal) {
+        for (page.pointers(), 0..) |offset, idx| {
+            var cell = page.cell(offset);
+            const next_page_id = mem.readInt(PageId, cell.val()[0..8], .little);
+            const child_result = try expectValidTreeNode(allocator, tree, next_page_id);
+            const cmp = mem.order(u8, child_result.max_key, cell.key());
+            if (cmp == .gt or cmp == .eq) {
+                std.debug.print(
+                    "invalid internal node: page {d}, pointer {d}: " ++
+                        "child maximum key exceeds separator key\n" ++
+                        "  child page:    {d}\n" ++
+                        "  child max key: {s}\n" ++
+                        "  separator key: {s}\n",
+                    .{
+                        page_id,
+                        idx,
+                        next_page_id,
+                        child_result.max_key,
+                        cell.key(),
+                    },
+                );
+                return error.InvalidChild;
+            }
+        }
+        if (page.header().right_pointer != 0) {
+            const next_page_id = page.header().right_pointer;
+            const child_result = try expectValidTreeNode(allocator, tree, next_page_id);
+            const cmp = mem.order(u8, child_result.max_key, greatest_cell.key());
+            if (cmp == .lt) {
+                std.debug.print(
+                    "invalid internal node: page {d}, rightmost pointer: " ++
+                        "child maximum key exceeds separator key\n" ++
+                        "  child page:    {d}\n" ++
+                        "  child max key: {s}\n" ++
+                        "  separator key: {s}\n",
+                    .{
+                        page_id,
+                        next_page_id,
+                        child_result.max_key,
+                        greatest_cell.key(),
+                    },
+                );
+                return error.InvalidChild;
+            }
+        }
+    }
+
+    return .{
+        .max_key = try allocator.dupe(u8, greatest_cell.key()),
+    };
+}
 
 test "it finds keys in a leaf root node" {
     const io = std.testing.io;
@@ -374,6 +469,66 @@ test "it finds keys in a leaf root node" {
     try std.testing.expectEqualStrings("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", result.cell.?.val());
     result = try tree.find("blah", &storage);
     try std.testing.expect(result.cell == null);
+}
+
+test {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
+
+    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
+
+    var root: PageBuffer = .new(&storage);
+    root.header().* = .empty(.leaf);
+    try file.writePositionalAll(io, &storage, 0);
+
+    storage = undefined;
+    var tree: Tree = .load(io, file);
+
+    try tree.insert("1", "one", &storage);
+    try file.writePositionalAll(io, &storage, 0);
+    try tree.insert("3", "three", &storage);
+    try file.writePositionalAll(io, &storage, 0);
+    try tree.insert("2", "two", &storage);
+    try file.writePositionalAll(io, &storage, 0);
+
+    var result = try tree.find("1", &storage);
+    try std.testing.expectEqualStrings("one", result.cell.?.val());
+    result = try tree.find("2", &storage);
+    try std.testing.expectEqualStrings("two", result.cell.?.val());
+    result = try tree.find("3", &storage);
+    try std.testing.expectEqualStrings("three", result.cell.?.val());
+
+    try expectValidTree(&tree);
+}
+
+test "insert random keys" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
+
+    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
+
+    var root: PageBuffer = .new(&storage);
+    root.header().* = .empty(.leaf);
+    try file.writePositionalAll(io, &storage, 0);
+
+    storage = undefined;
+    var tree: Tree = .load(io, file);
+
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const random = prng.random();
+
+    for (0..100) |_| {
+        var key: [10]u8 = undefined;
+        random.bytes(&key);
+        try tree.insert(&key, "one", &storage);
+        try file.writePositionalAll(io, &storage, 0);
+    }
+
+    try expectValidTree(&tree);
 }
 
 //  fanout = 4
@@ -543,171 +698,4 @@ test "some tree" {
     try std.testing.expectEqualStrings("eight", result.cell.?.val());
     // fails because 10 is less than 9 lexically, i should use alphabet or stop at 9
     //try std.testing.expectEqualStrings("nine", (try tree.find("9", &storage)).?);
-}
-
-test {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
-
-    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
-
-    var root: PageBuffer = .new(&storage);
-    root.header().* = .empty(.leaf);
-    try file.writePositionalAll(io, &storage, 0);
-
-    storage = undefined;
-    var tree: Tree = .load(io, file);
-
-    try tree.insert("1", "one", &storage);
-    try file.writePositionalAll(io, &storage, 0);
-    try tree.insert("3", "three", &storage);
-    try file.writePositionalAll(io, &storage, 0);
-    try tree.insert("2", "two", &storage);
-    try file.writePositionalAll(io, &storage, 0);
-
-    var result = try tree.find("1", &storage);
-    try std.testing.expectEqualStrings("one", result.cell.?.val());
-    result = try tree.find("2", &storage);
-    try std.testing.expectEqualStrings("two", result.cell.?.val());
-    result = try tree.find("3", &storage);
-    try std.testing.expectEqualStrings("three", result.cell.?.val());
-
-    try expectValidTree(&tree);
-}
-
-test "insert random keys" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
-
-    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
-
-    var root: PageBuffer = .new(&storage);
-    root.header().* = .empty(.leaf);
-    try file.writePositionalAll(io, &storage, 0);
-
-    storage = undefined;
-    var tree: Tree = .load(io, file);
-
-    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
-    const random = prng.random();
-
-    for (0..100) |_| {
-        var key: [10]u8 = undefined;
-        random.bytes(&key);
-        try tree.insert(&key, "one", &storage);
-        try file.writePositionalAll(io, &storage, 0);
-    }
-
-    try expectValidTree(&tree);
-}
-
-// -- test helpers --
-
-const validPageResult = struct {
-    max_key: []u8,
-};
-
-/// Validate a b+tree and check its invariants.
-pub fn expectValidTree(tree: *Tree) !void {
-    if (!builtin.is_test) @compileError("expectValidTree is only allowed in testing");
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    _ = try expectValidTreeNode(allocator, tree, tree.root_page_id);
-}
-
-pub fn expectValidTreeNode(allocator: mem.Allocator, tree: *Tree, page_id: PageId) !validPageResult {
-    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
-
-    const n = try tree.file.readPositionalAll(tree.io, &storage, page_id * page_size);
-    if (n != page_size)
-        return error.InvalidNode;
-    var page: PageBuffer = .new(&storage);
-
-    // 1. root.pointers() is sorted
-    // 2. max_key(child[N]) < key[N]
-    assert(page.header().magic == page_magic);
-    var prev_off = page.pointers()[0];
-    for (page.pointers(), 0..) |offset, idx| {
-        assert(offset < page_size);
-        var prev_cell = page.cell(prev_off);
-        var current_cell = page.cell(offset);
-        switch (mem.order(u8, current_cell.key(), prev_cell.key())) {
-            .lt => {
-                std.debug.print(
-                    "invalid node: page {d}, pointer {d}: keys are out of order\n" ++
-                        "  previous key: {s}\n" ++
-                        "  current key:  {s}\n",
-                    .{
-                        page_id,
-                        idx,
-                        prev_cell.key(),
-                        current_cell.key(),
-                    },
-                );
-                return error.InvalidPointers;
-            },
-            else => {},
-        }
-        prev_off = offset;
-    }
-
-    var greatest_cell = page.cell(page.pointers()[page.pointers().len - 1]);
-
-    if (page.header().type == .internal) {
-        for (page.pointers(), 0..) |offset, idx| {
-            var cell = page.cell(offset);
-            const next_page_id = mem.readInt(PageId, cell.val()[0..8], .little);
-            const child_result = try expectValidTreeNode(allocator, tree, next_page_id);
-            const cmp = mem.order(u8, child_result.max_key, cell.key());
-            if (cmp == .gt or cmp == .eq) {
-                std.debug.print(
-                    "invalid internal node: page {d}, pointer {d}: " ++
-                        "child maximum key exceeds separator key\n" ++
-                        "  child page:    {d}\n" ++
-                        "  child max key: {s}\n" ++
-                        "  separator key: {s}\n",
-                    .{
-                        page_id,
-                        idx,
-                        next_page_id,
-                        child_result.max_key,
-                        cell.key(),
-                    },
-                );
-                return error.InvalidChild;
-            }
-        }
-        if (page.header().right_pointer != 0) {
-            const next_page_id = page.header().right_pointer;
-            const child_result = try expectValidTreeNode(allocator, tree, next_page_id);
-            const cmp = mem.order(u8, child_result.max_key, greatest_cell.key());
-            if (cmp == .lt) {
-                std.debug.print(
-                    "invalid internal node: page {d}, rightmost pointer: " ++
-                        "child maximum key exceeds separator key\n" ++
-                        "  child page:    {d}\n" ++
-                        "  child max key: {s}\n" ++
-                        "  separator key: {s}\n",
-                    .{
-                        page_id,
-                        next_page_id,
-                        child_result.max_key,
-                        greatest_cell.key(),
-                    },
-                );
-                return error.InvalidChild;
-            }
-        }
-    }
-
-    return .{
-        .max_key = try allocator.dupe(u8, greatest_cell.key()),
-    };
 }
