@@ -172,6 +172,16 @@ pub const Cell = struct {
     }
 };
 
+/// The result returned by a btree lookup.
+/// Lookup will stop when a leaf node is found and optionally the key is found.
+pub const FindResult = struct {
+    cell: ?Cell,
+    page: PageBuffer,
+    /// Index of the pointer that points to key upper bound in page.
+    /// If null, then the key is the greatest in the page.
+    upper_bound_idx: ?usize,
+};
+
 pub const Tree = struct {
     const Self = @This();
     io: Io,
@@ -197,11 +207,12 @@ pub const Tree = struct {
         };
     }
 
-    pub fn find(self: *Self, key: []const u8, page_buf: *[page_size]u8) !?[]u8 {
+    pub fn find(self: *Self, key: []const u8, page_buf: *[page_size]u8) !FindResult {
         var page_id: u64 = self.root_page_id;
 
         var page: PageBuffer = undefined;
         var header: *PageHeader = undefined;
+        var upper_bound_idx: ?usize = null;
         nodes_loop: while (true) {
             const page_offset = page_id * page_size;
             //var page_buf: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
@@ -212,10 +223,10 @@ pub const Tree = struct {
 
             page = .new(page_buf);
             header = page.header();
+            upper_bound_idx = null;
 
             var low: usize = 0;
             var high: usize = page.pointers().len;
-            var upper_bound_idx: ?usize = null;
             if (high == 0) {
                 // reached empty node.
                 std.debug.print("empty node!!\n", .{});
@@ -246,7 +257,11 @@ pub const Tree = struct {
                             },
                             .leaf => {
                                 std.debug.print("equal! {s}\n", .{key});
-                                return cell.val();
+                                return .{
+                                    .cell = cell,
+                                    .page = page,
+                                    .upper_bound_idx = upper_bound_idx,
+                                };
                             },
                         }
                     },
@@ -274,35 +289,39 @@ pub const Tree = struct {
             }
         }
 
-        return null;
+        return .{
+            .cell = null,
+            .page = page,
+            .upper_bound_idx = upper_bound_idx,
+        };
+    }
 
-        //const raw_record_size = key.len + value.len + (@sizeOf(u64) * 2);
-        //const needed_space = @sizeOf(CellOffset) + raw_record_size;
-        //if (header.freeSpace() == 0) {
-        //    // split page
-        //} else {
-        //    // there is enough space
-        //    if (needed_space > max_record_size or header.freeSpace() < needed_space) {
-        //        // extend node size (use an off page)
-        //    } else {
-        //        // insert
-        //        const _pointers: [*]CellOffset = @ptrCast(&page_buf[@sizeOf(PageHeader)]);
-        //        const pointers: []CellOffset = _pointers[0..header.number_of_cells];
+    pub fn insert(
+        self: *Self,
+        key: []const u8,
+        value: []const u8,
+        page_buf: *[page_size]u8,
+    ) !void {
+        var find_result = try self.find(key, page_buf);
+        var page: PageBuffer = find_result.page;
+        if (find_result.cell != null)
+            return error.KeyAlreadyExists;
 
-        //        const new_upper = header.upper - raw_record_size;
-        //        header.upper = new_upper;
-        //        header.number_of_cells += 1;
-        //        if (pointers.len == 0) {
-        //            const coffset: *CellOffset = @ptrCast(@alignCast(&page_buf[header.lower]));
-        //            coffset.* = new_upper;
-        //            header.lower += @sizeOf(CellOffset);
-        //            try self.file.writePositionalAll(self.io, &page_buf, page_offset);
-        //        } else {
-        //            @panic("w0t");
-        //        }
-        //        // binary search
-        //    }
-        //}
+        // now, figure out where to insert
+        const expected_size = key.len + value.len + @sizeOf(u64) * 2;
+        if (find_result.page.header().freeSpace() < expected_size + @sizeOf(CellOffset)) {
+            @panic("split unimplemented");
+        }
+        const insert_idx = find_result.upper_bound_idx orelse page.pointers().len;
+        if (find_result.upper_bound_idx) |idx| {
+            // shift pointers to right (starting from upper bound)
+            @memmove(page.pointers().ptr[0 .. page.pointers().len + 1][idx + 1 ..], page.pointers()[idx..]);
+        }
+        page.header().number_of_cells += 1;
+        page.header().upper -= expected_size;
+        page.pointers()[insert_idx] = page.header().upper;
+        var cell: Cell = .raw(page.inner[page.header().upper..].ptr);
+        cell.from_keyval(key, value);
     }
 };
 
@@ -345,10 +364,14 @@ test "it finds keys in a leaf root node" {
 
     var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
     var tree: Tree = .load(io, file);
-    try std.testing.expectEqualStrings("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", (try tree.find("KA", &storage)).?);
-    try std.testing.expectEqualStrings("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", (try tree.find("KB", &storage)).?);
-    try std.testing.expectEqualStrings("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", (try tree.find("KC", &storage)).?);
-    try std.testing.expect(try tree.find("blah", &storage) == null);
+    var result = try tree.find("KA", &storage);
+    try std.testing.expectEqualStrings("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", result.cell.?.val());
+    result = try tree.find("KB", &storage);
+    try std.testing.expectEqualStrings("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", result.cell.?.val());
+    result = try tree.find("KC", &storage);
+    try std.testing.expectEqualStrings("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", result.cell.?.val());
+    result = try tree.find("blah", &storage);
+    try std.testing.expect(result.cell == null);
 }
 
 //  fanout = 4
@@ -491,22 +514,172 @@ test "some tree" {
 
     test_cell = undefined;
     cell = .raw(&test_cell);
-    cell.from_keyval("10", "ten");
-    page.append_cell(&test_cell);
+    //cell.from_keyval("10", "ten");
+    //page.append_cell(&test_cell);
 
     try file.writePositionalAll(io, &buf, 7 * page_size);
 
     var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
     var tree: Tree = .load(io, file);
 
-    try std.testing.expectEqualStrings("one", (try tree.find("1", &storage)).?);
-    try std.testing.expectEqualStrings("two", (try tree.find("2", &storage)).?);
-    try std.testing.expectEqualStrings("three", (try tree.find("3", &storage)).?);
-    try std.testing.expectEqualStrings("four", (try tree.find("4", &storage)).?);
-    try std.testing.expectEqualStrings("five", (try tree.find("5", &storage)).?);
-    try std.testing.expectEqualStrings("six", (try tree.find("6", &storage)).?);
-    try std.testing.expectEqualStrings("seven", (try tree.find("7", &storage)).?);
-    try std.testing.expectEqualStrings("eight", (try tree.find("8", &storage)).?);
-    // fails because 10 is less than 9 lexically, i should use alphabit or stop at 9
+    try expectValidTree(&tree);
+
+    var result = try tree.find("1", &storage);
+    try std.testing.expectEqualStrings("one", result.cell.?.val());
+    result = try tree.find("2", &storage);
+    try std.testing.expectEqualStrings("two", result.cell.?.val());
+    result = try tree.find("3", &storage);
+    try std.testing.expectEqualStrings("three", result.cell.?.val());
+    result = try tree.find("4", &storage);
+    try std.testing.expectEqualStrings("four", result.cell.?.val());
+    result = try tree.find("5", &storage);
+    try std.testing.expectEqualStrings("five", result.cell.?.val());
+    result = try tree.find("6", &storage);
+    try std.testing.expectEqualStrings("six", result.cell.?.val());
+    result = try tree.find("7", &storage);
+    try std.testing.expectEqualStrings("seven", result.cell.?.val());
+    result = try tree.find("8", &storage);
+    try std.testing.expectEqualStrings("eight", result.cell.?.val());
+    // fails because 10 is less than 9 lexically, i should use alphabet or stop at 9
     //try std.testing.expectEqualStrings("nine", (try tree.find("9", &storage)).?);
+}
+
+test {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    _ = gpa;
+    Io.Dir.cwd().deleteFile(io, "./test4.tree") catch {};
+    const file = try Io.Dir.cwd().createFile(io, "./test4.tree", .{ .read = true });
+
+    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
+
+    var root: PageBuffer = .new(&storage);
+    root.header().* = .empty(.leaf);
+    try file.writePositionalAll(io, &storage, 0);
+
+    storage = undefined;
+    var tree: Tree = .load(io, file);
+
+    try tree.insert("1", "one", &storage);
+    try file.writePositionalAll(io, &storage, 0);
+    try tree.insert("3", "three", &storage);
+    try file.writePositionalAll(io, &storage, 0);
+    try tree.insert("2", "two", &storage);
+    try file.writePositionalAll(io, &storage, 0);
+
+    var result = try tree.find("1", &storage);
+    try std.testing.expectEqualStrings("one", result.cell.?.val());
+    result = try tree.find("2", &storage);
+    try std.testing.expectEqualStrings("two", result.cell.?.val());
+    result = try tree.find("3", &storage);
+    try std.testing.expectEqualStrings("three", result.cell.?.val());
+
+    try expectValidTree(&tree);
+}
+
+// -- test helpers --
+
+const validPageResult = struct {
+    max_key: []u8,
+};
+
+/// Validate a b+tree and check its invariants.
+pub fn expectValidTree(tree: *Tree) !void {
+    if (!builtin.is_test) @compileError("expectValidTree is only allowed in testing");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    _ = try expectValidTreeNode(allocator, tree, tree.root_page_id);
+}
+
+pub fn expectValidTreeNode(allocator: mem.Allocator, tree: *Tree, page_id: PageId) !validPageResult {
+    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
+
+    const n = try tree.file.readPositionalAll(tree.io, &storage, page_id * page_size);
+    if (n != page_size)
+        return error.InvalidNode;
+    var page: PageBuffer = .new(&storage);
+
+    // 1. root.pointers() is sorted
+    // 2. max_key(child[N]) < key[N]
+    assert(page.header().magic == page_magic);
+    var prev_off = page.pointers()[0];
+    for (page.pointers(), 0..) |offset, idx| {
+        assert(offset < page_size);
+        var prev_cell = page.cell(prev_off);
+        var current_cell = page.cell(offset);
+        switch (mem.order(u8, current_cell.key(), prev_cell.key())) {
+            .lt => {
+                std.debug.print(
+                    "invalid node: page {d}, pointer {d}: keys are out of order\n" ++
+                        "  previous key: {s}\n" ++
+                        "  current key:  {s}\n",
+                    .{
+                        page_id,
+                        idx,
+                        prev_cell.key(),
+                        current_cell.key(),
+                    },
+                );
+                return error.InvalidPointers;
+            },
+            else => {},
+        }
+        prev_off = offset;
+    }
+
+    var greatest_cell = page.cell(page.pointers()[page.pointers().len - 1]);
+
+    if (page.header().type == .internal) {
+        for (page.pointers(), 0..) |offset, idx| {
+            var cell = page.cell(offset);
+            const next_page_id = mem.readInt(PageId, cell.val()[0..8], .little);
+            const child_result = try expectValidTreeNode(allocator, tree, next_page_id);
+            const cmp = mem.order(u8, child_result.max_key, cell.key());
+            if (cmp == .gt or cmp == .eq) {
+                std.debug.print(
+                    "invalid internal node: page {d}, pointer {d}: " ++
+                        "child maximum key exceeds separator key\n" ++
+                        "  child page:    {d}\n" ++
+                        "  child max key: {s}\n" ++
+                        "  separator key: {s}\n",
+                    .{
+                        page_id,
+                        idx,
+                        next_page_id,
+                        child_result.max_key,
+                        cell.key(),
+                    },
+                );
+                return error.InvalidChild;
+            }
+        }
+        if (page.header().right_pointer != 0) {
+            const next_page_id = page.header().right_pointer;
+            const child_result = try expectValidTreeNode(allocator, tree, next_page_id);
+            const cmp = mem.order(u8, child_result.max_key, greatest_cell.key());
+            if (cmp == .lt) {
+                std.debug.print(
+                    "invalid internal node: page {d}, rightmost pointer: " ++
+                        "child maximum key exceeds separator key\n" ++
+                        "  child page:    {d}\n" ++
+                        "  child max key: {s}\n" ++
+                        "  separator key: {s}\n",
+                    .{
+                        page_id,
+                        next_page_id,
+                        child_result.max_key,
+                        greatest_cell.key(),
+                    },
+                );
+                return error.InvalidChild;
+            }
+        }
+    }
+
+    return .{
+        .max_key = try allocator.dupe(u8, greatest_cell.key()),
+    };
 }
