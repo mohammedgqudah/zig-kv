@@ -55,7 +55,7 @@ pub const PageHeader = extern struct {
 /// Just like the rest of the code, this is not thread-safe, yet.
 pub const PageCache = struct {
     pub const Self = @This();
-    cache: std.AutoHashMap(PageId, PageBuffer),
+    cache: std.AutoHashMap(PageId, *PageBuffer),
     // TODO: use a different allocator for the hashmap and the page buffer?
     allocator: mem.Allocator,
     file: Io.File,
@@ -72,20 +72,27 @@ pub const PageCache = struct {
         };
     }
 
-    fn load_page(self: *Self, id: PageId) !PageBuffer {
+    fn load_page(self: *Self, id: PageId) !*PageBuffer {
+        // TODO: should page buf be a fixed array inside PageBuffer? 
+        //       it would allow us to do a single allocation.
         const page_buf = try self.allocator.alloc(u8, page_size);
-        errdefer self.allocator.free(page_buf);
+        const page = try self.allocator.create(PageBuffer);
+        errdefer {
+            self.allocator.free(page_buf);
+            self.allocator.destroy(page);
+        }
 
         const read_len = try self.file.readPositionalAll(self.io, page_buf, id * page_size);
         if (read_len != page_buf.len) {
             return error.IncompletePage;
         }
 
-        return .new(page_buf, id);
+        page.* = .new(page_buf, id);
+        return page;
     }
 
     pub fn mark_page_dirty(self: *Self, id: PageId) !void {
-        var page = self.cache.getPtr(id) orelse return error.PageNotFound;
+        var page: *PageBuffer = self.cache.get(id) orelse return error.PageNotFound;
         page.is_dirty = true;
     }
 
@@ -94,7 +101,7 @@ pub const PageCache = struct {
         // TODO: consecutive blocks can be written as a single operation.
         var it = self.cache.iterator();
         while (it.next()) |entry| {
-            var page = entry.value_ptr;
+            var page: *PageBuffer = entry.value_ptr.*;
             const id = entry.key_ptr.*;
             _ = try self.file.writePositionalAll(self.io, page.inner, id * page_size);
             page.is_dirty = false;
@@ -114,23 +121,31 @@ pub const PageCache = struct {
         return id;
     }
 
-    pub fn get(self: *Self, id: PageId) !?PageBuffer {
+    pub fn get(self: *Self, id: PageId) !?*PageBuffer {
         const result = try self.cache.getOrPut(id);
         if (!result.found_existing) {
             errdefer _ = self.cache.remove(id);
             result.value_ptr.* = try self.load_page(id);
         }
-        _ = result.value_ptr.refcnt.fetchAdd(1, .monotonic);
+        _ = result.value_ptr.*.refcnt.fetchAdd(1, .monotonic);
 
         return result.value_ptr.*;
     }
-
+    
+    /// This will writeback all dirty pages, and free *all* page buffers.
     pub fn deinit(self: *Self) void {
         // TODO: writeback failing should be safe, since we will have WAL (later)
         self.writeback() catch {};
         var it = self.cache.iterator();
         while (it.next()) |entry| {
-            self.allocator.free(entry.value_ptr.inner);
+            // if the page buffer is not referenced, then it's our responsiblity
+            // to free it.
+            // TODO: but then, a "put" operation must be provided, it does not make sense
+            //          to deinit the tree and still have page references.
+            //if (entry.value_ptr.*.refcnt.load(.monotonic) == 0) {
+                self.allocator.free(entry.value_ptr.*.inner);
+                self.allocator.destroy(entry.value_ptr.*);
+            //}
         }
         self.cache.deinit();
     }
@@ -282,7 +297,7 @@ pub const Cell = struct {
 /// Lookup will stop when a leaf node is found and optionally the key is found.
 pub const FindResult = struct {
     cell: ?Cell,
-    page: PageBuffer,
+    page: *PageBuffer,
     /// Index of the pointer that points to key upper bound in page.
     /// If null, then the key is the greatest in the page.
     upper_bound_idx: ?usize,
@@ -319,7 +334,7 @@ pub const Tree = struct {
     pub fn find(self: *Self, key: []const u8) !FindResult {
         var page_id: u64 = self.root_page_id;
 
-        var page: PageBuffer = undefined;
+        var page: *PageBuffer = undefined;
         var header: *PageHeader = undefined;
         var upper_bound_idx: ?usize = null;
         nodes_loop: while (true) {
@@ -404,7 +419,7 @@ pub const Tree = struct {
         value: []const u8,
     ) !void {
         var find_result = try self.find(key);
-        var page: PageBuffer = find_result.page;
+        var page: *PageBuffer = find_result.page;
         if (find_result.cell != null)
             return error.KeyAlreadyExists;
 
@@ -452,7 +467,7 @@ pub fn expectValidTreeNode(
     tree: *Tree,
     page_id: PageId,
 ) !validPageResult {
-    var page: PageBuffer = (try tree.page_cache.get(page_id)).?;
+    var page: *PageBuffer = (try tree.page_cache.get(page_id)).?;
 
     // 1. root.pointers() is sorted
     // 2. max_key(child[N]) < key[N]
