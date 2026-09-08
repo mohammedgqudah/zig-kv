@@ -12,8 +12,8 @@ pub const page_magic: u32 = 0x44415441;
 pub const page_size: u32 = 1024 * 4; // 4kb for now
 pub const max_record_size: u32 = page_size / 3;
 // a pointer in the pointers directory in a slotted page
-const CellOffset = u64;
-const PageId = u64;
+pub const CellOffset = u64;
+pub const PageId = u64;
 
 /// In-memory representation of a slotted page.
 /// ------------------------------
@@ -47,186 +47,6 @@ pub const PageHeader = extern struct {
     /// free space in the page for pointers and cells
     pub fn freeSpace(self: *Self) usize {
         return self.upper - self.lower;
-    }
-};
-
-/// A hashmap based page cache.
-///
-/// Just like the rest of the code, this is not thread-safe, yet.
-pub const PageCache = struct {
-    pub const Self = @This();
-    cache: std.AutoHashMap(PageId, *PageBuffer),
-    // TODO: use a different allocator for the hashmap and the page buffer?
-    allocator: mem.Allocator,
-    file: Io.File,
-    io: Io,
-    // TODO: this is temporary. we should track free blocks some other way.
-    free_page_id: PageId = 0,
-
-    pub fn new(allocator: mem.Allocator, file: Io.File, io: Io) Self {
-        return .{
-            .allocator = allocator,
-            .cache = .init(allocator),
-            .file = file,
-            .io = io,
-        };
-    }
-
-    fn load_page(self: *Self, id: PageId) !*PageBuffer {
-        // TODO: should page buf be a fixed array inside PageBuffer?
-        //       it would allow us to do a single allocation.
-        const page_buf = try self.allocator.alloc(u8, page_size);
-        const page = try self.allocator.create(PageBuffer);
-        errdefer {
-            self.allocator.free(page_buf);
-            self.allocator.destroy(page);
-        }
-
-        const read_len = try self.file.readPositionalAll(self.io, page_buf, id * page_size);
-        if (read_len != page_buf.len) {
-            return error.IncompletePage;
-        }
-
-        page.* = .new(page_buf, id);
-        return page;
-    }
-
-    pub fn mark_page_dirty(self: *Self, id: PageId) !void {
-        var page: *PageBuffer = self.cache.get(id) orelse return error.PageNotFound;
-        page.is_dirty = true;
-    }
-
-    inline fn writeback_page(self: *Self, page: *PageBuffer) void {
-        self.file.writePositionalAll(self.io, page.inner, page.page_id * page_size) catch {
-            @panic("writeback failed");
-        };
-        page.is_dirty = false;
-    }
-
-    /// TODO: i'm not sure if this is the right API and if it belongs in PageCache
-    /// TODO: why even accept a page id? shouldn't we track the next free page id and return it?
-    pub fn allocate(self: *Self) !PageId {
-        const id = self.free_page_id;
-        self.free_page_id += 1;
-        errdefer self.free_page_id -= 1;
-
-        const page_buf: [page_size]u8 = undefined;
-        _ = try self.file.writePositionalAll(self.io, &page_buf, id * page_size);
-        // TOOD: should allocating also cache the page?
-        return id;
-    }
-
-    /// Get a page buffer.
-    ///
-    /// # Example
-    ///
-    /// ```zig
-    /// const result = try page_cache.get(page_id);
-    /// const page = result orelse return null;
-    /// defer page_cache.put(page);
-    /// // modify the page
-    /// ```
-    pub fn get(self: *Self, id: PageId) !?*PageBuffer {
-        const result = try self.cache.getOrPut(id);
-        if (!result.found_existing) {
-            errdefer _ = self.cache.remove(id);
-            result.value_ptr.* = try self.load_page(id);
-        }
-        _ = result.value_ptr.*.refcnt.fetchAdd(1, .monotonic);
-
-        return result.value_ptr.*;
-    }
-
-    pub fn put(self: *Self, page: *PageBuffer) void {
-        const old_refcnt = page.refcnt.fetchSub(1, .monotonic);
-        if (old_refcnt == 1) {
-            self.writeback_page(page);
-            self.allocator.free(page.inner);
-            self.allocator.destroy(page);
-        }
-    }
-
-    /// This will writeback all dirty pages, and free *all* page buffers.
-    pub fn deinit(self: *Self) void {
-        var it = self.cache.iterator();
-        while (it.next()) |entry| {
-            self.put(entry.value_ptr.*);
-        }
-        self.cache.deinit();
-    }
-};
-
-test PageCache {
-    const io = std.testing.io;
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try tmp.dir.createFile(io, "file", .{ .read = true });
-
-    var cache: PageCache = .new(allocator, file, io);
-    defer cache.deinit();
-    assert(cache.get(0) == error.IncompletePage);
-}
-
-/// A wrapper around the page bytes
-pub const PageBuffer = struct {
-    const Self = @This();
-    inner: []u8,
-    // This should not be accessed directly, only by the page cache.
-    // Initial value is *1* because it's referenced by the page cache.
-    refcnt: std.atomic.Value(usize) = .init(1),
-    // Whether the page has been modified and is out of sync with disk.
-    is_dirty: bool = false,
-    page_id: PageId,
-
-    pub fn new(buffer: []u8, id: PageId) Self {
-        assert(buffer.len == page_size);
-
-        return .{
-            .inner = buffer,
-            .page_id = id,
-        };
-    }
-
-    pub fn header(self: *Self) *PageHeader {
-        return @ptrCast(@alignCast(self.inner.ptr));
-    }
-
-    pub fn pointers(self: *Self) []CellOffset {
-        const end = @sizeOf(CellOffset) * self.header().number_of_cells;
-        //std.debug.print("end {d}; cells {d} \n", .{ end, self.header().number_of_cells });
-        const raw: []u8 = self
-            .inner[@sizeOf(PageHeader)..][0..end];
-        const __ptrs: [*]CellOffset = @ptrCast(@alignCast(raw.ptr));
-        return __ptrs[0..self.header().number_of_cells];
-    }
-
-    /// Get the nth offset (0-based).
-    pub fn offset(self: *Self, n: usize) CellOffset {
-        if (n > self.header().number_of_cells - 1) {
-            @panic("no cell");
-        }
-        return self.pointers()[n];
-    }
-
-    pub fn cell(self: *Self, off: CellOffset) Cell {
-        return .load(self.inner[off..].ptr);
-    }
-
-    /// Append a cell to the page.
-    /// This will take care of updating the page metadata.
-    pub fn append_cell(self: *Self, record: []u8) void {
-        comptime if (!builtin.is_test) {
-            @compileError("test-only function");
-        };
-        var head = self.header();
-        const ptr_idx = head.number_of_cells;
-        head.number_of_cells += 1;
-        head.upper -= record.len;
-        head.lower += @sizeOf(CellOffset);
-        self.pointers()[ptr_idx] = head.upper;
-        @memcpy(self.inner[head.upper .. head.upper + record.len], record);
     }
 };
 
@@ -295,6 +115,67 @@ pub const Cell = struct {
         self.write_val_size(value.len);
         @memcpy(self.key(), _key);
         @memcpy(self.val(), value);
+    }
+};
+
+/// A wrapper around the page bytes
+pub const PageBuffer = struct {
+    const Self = @This();
+    inner: []u8,
+    // This should not be accessed directly, only by the page cache.
+    // Initial value is *1* because it's referenced by the page cache.
+    refcnt: std.atomic.Value(usize) = .init(1),
+    // Whether the page has been modified and is out of sync with disk.
+    is_dirty: bool = false,
+    page_id: PageId,
+
+    pub fn new(buffer: []u8, id: PageId) Self {
+        assert(buffer.len == page_size);
+
+        return .{
+            .inner = buffer,
+            .page_id = id,
+        };
+    }
+
+    pub fn header(self: *Self) *PageHeader {
+        return @ptrCast(@alignCast(self.inner.ptr));
+    }
+
+    pub fn pointers(self: *Self) []CellOffset {
+        const end = @sizeOf(CellOffset) * self.header().number_of_cells;
+        //std.debug.print("end {d}; cells {d} \n", .{ end, self.header().number_of_cells });
+        const raw: []u8 = self
+            .inner[@sizeOf(PageHeader)..][0..end];
+        const __ptrs: [*]CellOffset = @ptrCast(@alignCast(raw.ptr));
+        return __ptrs[0..self.header().number_of_cells];
+    }
+
+    /// Get the nth offset (0-based).
+    pub fn offset(self: *Self, n: usize) CellOffset {
+        if (n > self.header().number_of_cells - 1) {
+            @panic("no cell");
+        }
+        return self.pointers()[n];
+    }
+
+    pub fn cell(self: *Self, off: CellOffset) Cell {
+        return .load(self.inner[off..].ptr);
+    }
+
+    /// Append a cell to the page.
+    /// This will take care of updating the page metadata.
+    pub fn append_cell(self: *Self, record: []u8) void {
+        comptime if (!builtin.is_test) {
+            @compileError("test-only function");
+        };
+        var head = self.header();
+        const ptr_idx = head.number_of_cells;
+        head.number_of_cells += 1;
+        head.upper -= record.len;
+        head.lower += @sizeOf(CellOffset);
+        self.pointers()[ptr_idx] = head.upper;
+        @memcpy(self.inner[head.upper .. head.upper + record.len], record);
     }
 };
 
@@ -456,367 +337,108 @@ pub const Tree = struct {
     }
 };
 
-const validPageResult = struct {
-    max_key: []u8,
-};
-
-/// Validate a b+tree and check its invariants.
-pub fn expectValidTree(tree: *Tree) !void {
-    if (!builtin.is_test) @compileError("expectValidTree is only allowed in testing");
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    _ = try expectValidTreeNode(allocator, tree, tree.root_page_id);
-}
-
-pub fn expectValidTreeNode(
+/// A hashmap based page cache.
+///
+/// Just like the rest of the code, this is not thread-safe, yet.
+pub const PageCache = struct {
+    pub const Self = @This();
+    cache: std.AutoHashMap(PageId, *PageBuffer),
+    // TODO: use a different allocator for the hashmap and the page buffer?
     allocator: mem.Allocator,
-    tree: *Tree,
-    page_id: PageId,
-) !validPageResult {
-    var page: *PageBuffer = (try tree.page_cache.get(page_id)).?;
-    defer tree.page_cache.put(page);
+    file: Io.File,
+    io: Io,
+    // TODO: this is temporary. we should track free blocks some other way.
+    free_page_id: PageId = 0,
 
-    // 1. root.pointers() is sorted
-    // 2. max_key(child[N]) < key[N]
-    assert(page.header().magic == page_magic);
-    var prev_off = page.pointers()[0];
-    for (page.pointers(), 0..) |offset, idx| {
-        assert(offset < page_size);
-        var prev_cell = page.cell(prev_off);
-        var current_cell = page.cell(offset);
-        switch (mem.order(u8, current_cell.key(), prev_cell.key())) {
-            .lt => {
-                std.debug.print(
-                    "invalid node: page {d}, pointer {d}: keys are out of order\n" ++
-                        "  previous key: {s}\n" ++
-                        "  current key:  {s}\n",
-                    .{
-                        page_id,
-                        idx,
-                        prev_cell.key(),
-                        current_cell.key(),
-                    },
-                );
-                return error.InvalidPointers;
-            },
-            else => {},
+    pub fn new(allocator: mem.Allocator, file: Io.File, io: Io) Self {
+        return .{
+            .allocator = allocator,
+            .cache = .init(allocator),
+            .file = file,
+            .io = io,
+        };
+    }
+
+    fn load_page(self: *Self, id: PageId) !*PageBuffer {
+        // TODO: should page buf be a fixed array inside PageBuffer?
+        //       it would allow us to do a single allocation.
+        const page_buf = try self.allocator.alloc(u8, page_size);
+        const page = try self.allocator.create(PageBuffer);
+        errdefer {
+            self.allocator.free(page_buf);
+            self.allocator.destroy(page);
         }
-        prev_off = offset;
-    }
 
-    var greatest_cell = page.cell(page.pointers()[page.pointers().len - 1]);
-
-    if (page.header().type == .internal) {
-        for (page.pointers(), 0..) |offset, idx| {
-            var cell = page.cell(offset);
-            const next_page_id = mem.readInt(PageId, cell.val()[0..8], .little);
-            const child_result = try expectValidTreeNode(allocator, tree, next_page_id);
-            const cmp = mem.order(u8, child_result.max_key, cell.key());
-            if (cmp == .gt or cmp == .eq) {
-                std.debug.print(
-                    "invalid internal node: page {d}, pointer {d}: " ++
-                        "child maximum key exceeds separator key\n" ++
-                        "  child page:    {d}\n" ++
-                        "  child max key: {s}\n" ++
-                        "  separator key: {s}\n",
-                    .{
-                        page_id,
-                        idx,
-                        next_page_id,
-                        child_result.max_key,
-                        cell.key(),
-                    },
-                );
-                return error.InvalidChild;
-            }
+        const read_len = try self.file.readPositionalAll(self.io, page_buf, id * page_size);
+        if (read_len != page_buf.len) {
+            return error.IncompletePage;
         }
-        if (page.header().right_pointer != 0) {
-            const next_page_id = page.header().right_pointer;
-            const child_result = try expectValidTreeNode(allocator, tree, next_page_id);
-            const cmp = mem.order(u8, child_result.max_key, greatest_cell.key());
-            if (cmp == .lt) {
-                std.debug.print(
-                    "invalid internal node: page {d}, rightmost pointer: " ++
-                        "child maximum key exceeds separator key\n" ++
-                        "  child page:    {d}\n" ++
-                        "  child max key: {s}\n" ++
-                        "  separator key: {s}\n",
-                    .{
-                        page_id,
-                        next_page_id,
-                        child_result.max_key,
-                        greatest_cell.key(),
-                    },
-                );
-                return error.InvalidChild;
-            }
+
+        page.* = .new(page_buf, id);
+        return page;
+    }
+
+    pub fn mark_page_dirty(self: *Self, id: PageId) !void {
+        var page: *PageBuffer = self.cache.get(id) orelse return error.PageNotFound;
+        page.is_dirty = true;
+    }
+
+    inline fn writeback_page(self: *Self, page: *PageBuffer) void {
+        self.file.writePositionalAll(self.io, page.inner, page.page_id * page_size) catch {
+            @panic("writeback failed");
+        };
+        page.is_dirty = false;
+    }
+
+    /// TODO: i'm not sure if this is the right API and if it belongs in PageCache
+    /// TODO: why even accept a page id? shouldn't we track the next free page id and return it?
+    pub fn allocate(self: *Self) !PageId {
+        const id = self.free_page_id;
+        self.free_page_id += 1;
+        errdefer self.free_page_id -= 1;
+
+        const page_buf: [page_size]u8 = undefined;
+        _ = try self.file.writePositionalAll(self.io, &page_buf, id * page_size);
+        // TOOD: should allocating also cache the page?
+        return id;
+    }
+
+    /// Get a page buffer.
+    ///
+    /// # Example
+    ///
+    /// ```zig
+    /// const result = try page_cache.get(page_id);
+    /// const page = result orelse return null;
+    /// defer page_cache.put(page);
+    /// // modify the page
+    /// ```
+    pub fn get(self: *Self, id: PageId) !?*PageBuffer {
+        const result = try self.cache.getOrPut(id);
+        if (!result.found_existing) {
+            errdefer _ = self.cache.remove(id);
+            result.value_ptr.* = try self.load_page(id);
+        }
+        _ = result.value_ptr.*.refcnt.fetchAdd(1, .monotonic);
+
+        return result.value_ptr.*;
+    }
+
+    pub fn put(self: *Self, page: *PageBuffer) void {
+        const old_refcnt = page.refcnt.fetchSub(1, .monotonic);
+        if (old_refcnt == 1) {
+            self.writeback_page(page);
+            self.allocator.free(page.inner);
+            self.allocator.destroy(page);
         }
     }
 
-    return .{
-        .max_key = try allocator.dupe(u8, greatest_cell.key()),
-    };
-}
-
-test "it finds keys in a leaf root node" {
-    const io = std.testing.io;
-    const allocator = std.testing.allocator;
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
-
-    var buf: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
-    var test_cell: [48]u8 = undefined;
-
-    var root: PageBuffer = .new(&buf, 0);
-    root.header().* = .empty(.leaf);
-    for ("ABC") |fill| {
-        @memset(&test_cell, fill);
-        var cell: Cell = .raw(&test_cell);
-        const key = try fmt.allocPrint(gpa, "K{c}", .{fill});
-        defer gpa.free(key);
-        cell.write_key_size(key.len);
-        cell.write_val_size(test_cell.len - (@sizeOf(u64) * 2 + key.len));
-        @memcpy(cell.key(), key);
-        root.append_cell(&test_cell);
+    /// This will writeback all dirty pages, and free *all* page buffers.
+    pub fn deinit(self: *Self) void {
+        var it = self.cache.iterator();
+        while (it.next()) |entry| {
+            self.put(entry.value_ptr.*);
+        }
+        self.cache.deinit();
     }
-    try file.writePositionalAll(io, &buf, 0);
-
-    var tree: Tree = .load(allocator, io, file);
-    defer tree.deinit();
-
-    var result = try tree.find("KA");
-    try std.testing.expectEqualStrings("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", result.cell.?.val());
-    result = try tree.find("KB");
-    try std.testing.expectEqualStrings("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", result.cell.?.val());
-    result = try tree.find("KC");
-    try std.testing.expectEqualStrings("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", result.cell.?.val());
-    result = try tree.find("blah");
-    try std.testing.expect(result.cell == null);
-}
-
-test {
-    const io = std.testing.io;
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
-
-    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
-
-    var root: PageBuffer = .new(&storage, 0);
-    root.header().* = .empty(.leaf);
-    try file.writePositionalAll(io, &storage, 0);
-
-    var tree: Tree = .load(allocator, io, file);
-    defer tree.deinit();
-
-    try tree.insert("1", "one");
-    try tree.insert("3", "three");
-    try tree.insert("2", "two");
-
-    var result = try tree.find("1");
-    try std.testing.expectEqualStrings("one", result.cell.?.val());
-    result = try tree.find("2");
-    try std.testing.expectEqualStrings("two", result.cell.?.val());
-    result = try tree.find("3");
-    try std.testing.expectEqualStrings("three", result.cell.?.val());
-
-    try expectValidTree(&tree);
-}
-
-test "insert random keys" {
-    const io = std.testing.io;
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
-
-    var tree: Tree = try .empty(allocator, io, file);
-    defer tree.deinit();
-
-    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
-    const random = prng.random();
-
-    for (0..100) |_| {
-        var key: [10]u8 = undefined;
-        random.bytes(&key);
-        try tree.insert(&key, "one");
-    }
-
-    try expectValidTree(&tree);
-}
-
-//  fanout = 4
-//                  [7]                         page = 0
-//           ____/      \___
-//          /               \
-//      [3,     5]             [9]              page = 1 & 2
-//     /    |    \          /       \
-// [1, 2] [3, 4]  [5, 6]  [7, 8]    [9, 10]     page = 3, 4, 5, 6, 7
-test "some tree" {
-    const io = std.testing.io;
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
-
-    var buf: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
-    var test_cell: [48]u8 = undefined;
-
-    // root
-    var temp_page_id: PageId = 1;
-    var cell: Cell = .raw(&test_cell);
-    cell.from_keyval("7", @ptrCast(&temp_page_id));
-    var page: PageBuffer = .new(&buf, 0);
-    page.header().* = .empty(.internal);
-    page.header().right_pointer = 2;
-    page.append_cell(&test_cell);
-    try file.writePositionalAll(io, &buf, 0);
-
-    // [3, 5]
-    buf = undefined;
-    page = .new(&buf, 1);
-    page.header().* = .empty(.internal);
-    page.header().right_pointer = 5;
-
-    temp_page_id = 3;
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    cell.from_keyval("3", @ptrCast(&temp_page_id));
-    page.append_cell(&test_cell);
-
-    temp_page_id = 4;
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    cell.from_keyval("5", @ptrCast(&temp_page_id));
-    page.append_cell(&test_cell);
-
-    try file.writePositionalAll(io, &buf, 1 * page_size);
-
-    // [9]
-    buf = undefined;
-    page = .new(&buf, 2);
-    page.header().* = .empty(.internal);
-    page.header().right_pointer = 7;
-
-    temp_page_id = 6;
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    cell.from_keyval("9", @ptrCast(&temp_page_id));
-    page.append_cell(&test_cell);
-    try file.writePositionalAll(io, &buf, 2 * page_size);
-
-    // [1, 2]
-    buf = undefined;
-    page = .new(&buf, 3);
-    page.header().* = .empty(.leaf);
-
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    cell.from_keyval("1", "one");
-    page.append_cell(&test_cell);
-
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    cell.from_keyval("2", "two");
-    page.append_cell(&test_cell);
-
-    try file.writePositionalAll(io, &buf, 3 * page_size);
-
-    // [3, 4]
-    buf = undefined;
-    page = .new(&buf, 4);
-    page.header().* = .empty(.leaf);
-
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    cell.from_keyval("3", "three");
-    page.append_cell(&test_cell);
-
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    cell.from_keyval("4", "four");
-    page.append_cell(&test_cell);
-
-    try file.writePositionalAll(io, &buf, 4 * page_size);
-
-    // [5, 6]
-    buf = undefined;
-    page = .new(&buf, 5);
-    page.header().* = .empty(.leaf);
-
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    cell.from_keyval("5", "five");
-    page.append_cell(&test_cell);
-
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    cell.from_keyval("6", "six");
-    page.append_cell(&test_cell);
-
-    try file.writePositionalAll(io, &buf, 5 * page_size);
-
-    // [7, 8]
-    buf = undefined;
-    page = .new(&buf, 6);
-    page.header().* = .empty(.leaf);
-
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    cell.from_keyval("7", "seven");
-    page.append_cell(&test_cell);
-
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    cell.from_keyval("8", "eight");
-    page.append_cell(&test_cell);
-
-    try file.writePositionalAll(io, &buf, 6 * page_size);
-
-    // [9, 10]
-    buf = undefined;
-    page = .new(&buf, 7);
-    page.header().* = .empty(.leaf);
-
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    cell.from_keyval("9", "nine");
-    page.append_cell(&test_cell);
-
-    test_cell = undefined;
-    cell = .raw(&test_cell);
-    //cell.from_keyval("10", "ten");
-    //page.append_cell(&test_cell);
-
-    try file.writePositionalAll(io, &buf, 7 * page_size);
-
-    var tree: Tree = .load(allocator, io, file);
-    defer tree.deinit();
-
-    try expectValidTree(&tree);
-
-    var result = try tree.find("1");
-    try std.testing.expectEqualStrings("one", result.cell.?.val());
-    result = try tree.find("2");
-    try std.testing.expectEqualStrings("two", result.cell.?.val());
-    result = try tree.find("3");
-    try std.testing.expectEqualStrings("three", result.cell.?.val());
-    result = try tree.find("4");
-    try std.testing.expectEqualStrings("four", result.cell.?.val());
-    result = try tree.find("5");
-    try std.testing.expectEqualStrings("five", result.cell.?.val());
-    result = try tree.find("6");
-    try std.testing.expectEqualStrings("six", result.cell.?.val());
-    result = try tree.find("7");
-    try std.testing.expectEqualStrings("seven", result.cell.?.val());
-    result = try tree.find("8");
-    try std.testing.expectEqualStrings("eight", result.cell.?.val());
-    // fails because 10 is less than 9 lexically, i should use alphabet or stop at 9
-    //try std.testing.expectEqualStrings("nine", (try tree.find("9", &storage)).?);
-}
+};

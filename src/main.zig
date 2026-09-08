@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const stdx = @import("stdx.zig");
 const devmapper = @import("devicemapper.zig");
 const page = @import("page.zig");
+const page_tests = @import("page_tests.zig");
 
 const Io = std.Io;
 const assert = std.debug.assert;
@@ -164,4 +165,5 @@ test {
     std.testing.refAllDecls(devmapper);
     std.testing.refAllDecls(stdx);
     std.testing.refAllDecls(page);
+    std.testing.refAllDecls(page_tests);
 }
