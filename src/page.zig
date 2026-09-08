@@ -50,16 +50,142 @@ pub const PageHeader = extern struct {
     }
 };
 
+/// A hashmap based page cache.
+///
+/// Just like the rest of the code, this is not thread-safe, yet.
+pub const PageCache = struct {
+    pub const Self = @This();
+    cache: std.AutoHashMap(PageId, *PageBuffer),
+    // TODO: use a different allocator for the hashmap and the page buffer?
+    allocator: mem.Allocator,
+    file: Io.File,
+    io: Io,
+    // TODO: this is temporary. we should track free blocks some other way.
+    free_page_id: PageId = 0,
+
+    pub fn new(allocator: mem.Allocator, file: Io.File, io: Io) Self {
+        return .{
+            .allocator = allocator,
+            .cache = .init(allocator),
+            .file = file,
+            .io = io,
+        };
+    }
+
+    fn load_page(self: *Self, id: PageId) !*PageBuffer {
+        // TODO: should page buf be a fixed array inside PageBuffer?
+        //       it would allow us to do a single allocation.
+        const page_buf = try self.allocator.alloc(u8, page_size);
+        const page = try self.allocator.create(PageBuffer);
+        errdefer {
+            self.allocator.free(page_buf);
+            self.allocator.destroy(page);
+        }
+
+        const read_len = try self.file.readPositionalAll(self.io, page_buf, id * page_size);
+        if (read_len != page_buf.len) {
+            return error.IncompletePage;
+        }
+
+        page.* = .new(page_buf, id);
+        return page;
+    }
+
+    pub fn mark_page_dirty(self: *Self, id: PageId) !void {
+        var page: *PageBuffer = self.cache.get(id) orelse return error.PageNotFound;
+        page.is_dirty = true;
+    }
+
+    inline fn writeback_page(self: *Self, page: *PageBuffer) void {
+        self.file.writePositionalAll(self.io, page.inner, page.page_id * page_size) catch {
+            @panic("writeback failed");
+        };
+        page.is_dirty = false;
+    }
+
+    /// TODO: i'm not sure if this is the right API and if it belongs in PageCache
+    /// TODO: why even accept a page id? shouldn't we track the next free page id and return it?
+    pub fn allocate(self: *Self) !PageId {
+        const id = self.free_page_id;
+        self.free_page_id += 1;
+        errdefer self.free_page_id -= 1;
+
+        const page_buf: [page_size]u8 = undefined;
+        _ = try self.file.writePositionalAll(self.io, &page_buf, id * page_size);
+        // TOOD: should allocating also cache the page?
+        return id;
+    }
+
+    /// Get a page buffer.
+    ///
+    /// # Example
+    ///
+    /// ```zig
+    /// const result = try page_cache.get(page_id);
+    /// const page = result orelse return null;
+    /// defer page_cache.put(page);
+    /// // modify the page
+    /// ```
+    pub fn get(self: *Self, id: PageId) !?*PageBuffer {
+        const result = try self.cache.getOrPut(id);
+        if (!result.found_existing) {
+            errdefer _ = self.cache.remove(id);
+            result.value_ptr.* = try self.load_page(id);
+        }
+        _ = result.value_ptr.*.refcnt.fetchAdd(1, .monotonic);
+
+        return result.value_ptr.*;
+    }
+
+    pub fn put(self: *Self, page: *PageBuffer) void {
+        const old_refcnt = page.refcnt.fetchSub(1, .monotonic);
+        if (old_refcnt == 1) {
+            self.writeback_page(page);
+            self.allocator.free(page.inner);
+            self.allocator.destroy(page);
+        }
+    }
+
+    /// This will writeback all dirty pages, and free *all* page buffers.
+    pub fn deinit(self: *Self) void {
+        var it = self.cache.iterator();
+        while (it.next()) |entry| {
+            self.put(entry.value_ptr.*);
+        }
+        self.cache.deinit();
+    }
+};
+
+test PageCache {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "file", .{ .read = true });
+
+    var cache: PageCache = .new(allocator, file, io);
+    defer cache.deinit();
+    assert(cache.get(0) == error.IncompletePage);
+}
+
 /// A wrapper around the page bytes
 pub const PageBuffer = struct {
     const Self = @This();
     inner: []u8,
+    // This should not be accessed directly, only by the page cache.
+    // Initial value is *1* because it's referenced by the page cache.
+    refcnt: std.atomic.Value(usize) = .init(1),
+    // Whether the page has been modified and is out of sync with disk.
+    is_dirty: bool = false,
+    page_id: PageId,
 
-    pub fn new(buffer: []u8) Self {
+    pub fn new(buffer: []u8, id: PageId) Self {
         assert(buffer.len == page_size);
 
         return .{
             .inner = buffer,
+            .page_id = id,
         };
     }
 
@@ -176,7 +302,7 @@ pub const Cell = struct {
 /// Lookup will stop when a leaf node is found and optionally the key is found.
 pub const FindResult = struct {
     cell: ?Cell,
-    page: PageBuffer,
+    page: *PageBuffer,
     /// Index of the pointer that points to key upper bound in page.
     /// If null, then the key is the greatest in the page.
     upper_bound_idx: ?usize,
@@ -187,41 +313,41 @@ pub const Tree = struct {
     io: Io,
     file: Io.File,
     root_page_id: u64 = 0,
+    page_cache: PageCache,
 
     /// initialize a new tree, `file` is expected to be empty.
-    pub fn empty(io: Io, file: Io.File) !Self {
-        var root_node: [page_size]u8 align(@alignOf(PageHeader)) = mem.zeroes([page_size]u8);
-        const header: *PageHeader = @ptrCast(&root_node);
-        header.* = .empty(.internal);
-        try file.writePositionalAll(io, &root_node, 0);
+    pub fn empty(allocator: mem.Allocator, io: Io, file: Io.File) !Self {
+        var tree: Self = .load(allocator, io, file);
+        const root_id = try tree.page_cache.allocate();
+        tree.root_page_id = root_id;
+
+        var root_page = (try tree.page_cache.get(root_id)).?;
+        defer tree.page_cache.put(root_page);
+
+        root_page.header().* = .empty(.leaf);
+        try tree.page_cache.mark_page_dirty(root_id);
+
+        return tree;
+    }
+
+    pub fn load(allocator: mem.Allocator, io: Io, file: Io.File) Self {
         return .{
             .io = io,
             .file = file,
+            .page_cache = .new(allocator, file, io),
         };
     }
 
-    pub fn load(io: Io, file: Io.File) Self {
-        return .{
-            .io = io,
-            .file = file,
-        };
-    }
-
-    pub fn find(self: *Self, key: []const u8, page_buf: *[page_size]u8) !FindResult {
+    pub fn find(self: *Self, key: []const u8) !FindResult {
         var page_id: u64 = self.root_page_id;
 
-        var page: PageBuffer = undefined;
+        var page: *PageBuffer = undefined;
         var header: *PageHeader = undefined;
         var upper_bound_idx: ?usize = null;
         nodes_loop: while (true) {
-            const page_offset = page_id * page_size;
-            //var page_buf: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
-            const read_len = try self.file.readPositionalAll(self.io, page_buf, page_offset);
-            if (read_len != page_buf.len) {
-                @panic("database is corrupted");
-            }
+            page = (try self.page_cache.get(page_id)).?;
+            defer self.page_cache.put(page);
 
-            page = .new(page_buf);
             header = page.header();
             upper_bound_idx = null;
 
@@ -300,10 +426,9 @@ pub const Tree = struct {
         self: *Self,
         key: []const u8,
         value: []const u8,
-        page_buf: *[page_size]u8,
     ) !void {
-        var find_result = try self.find(key, page_buf);
-        var page: PageBuffer = find_result.page;
+        var find_result = try self.find(key);
+        var page: *PageBuffer = find_result.page;
         if (find_result.cell != null)
             return error.KeyAlreadyExists;
 
@@ -323,6 +448,11 @@ pub const Tree = struct {
         page.pointers()[insert_idx] = page.header().upper;
         var cell: Cell = .raw(page.inner[page.header().upper..].ptr);
         cell.from_keyval(key, value);
+        try self.page_cache.mark_page_dirty(page.page_id);
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.page_cache.deinit();
     }
 };
 
@@ -346,12 +476,8 @@ pub fn expectValidTreeNode(
     tree: *Tree,
     page_id: PageId,
 ) !validPageResult {
-    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
-
-    const n = try tree.file.readPositionalAll(tree.io, &storage, page_id * page_size);
-    if (n != page_size)
-        return error.InvalidNode;
-    var page: PageBuffer = .new(&storage);
+    var page: *PageBuffer = (try tree.page_cache.get(page_id)).?;
+    defer tree.page_cache.put(page);
 
     // 1. root.pointers() is sorted
     // 2. max_key(child[N]) < key[N]
@@ -437,6 +563,7 @@ pub fn expectValidTreeNode(
 
 test "it finds keys in a leaf root node" {
     const io = std.testing.io;
+    const allocator = std.testing.allocator;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -445,7 +572,7 @@ test "it finds keys in a leaf root node" {
     var buf: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
     var test_cell: [48]u8 = undefined;
 
-    var root: PageBuffer = .new(&buf);
+    var root: PageBuffer = .new(&buf, 0);
     root.header().* = .empty(.leaf);
     for ("ABC") |fill| {
         @memset(&test_cell, fill);
@@ -459,45 +586,44 @@ test "it finds keys in a leaf root node" {
     }
     try file.writePositionalAll(io, &buf, 0);
 
-    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
-    var tree: Tree = .load(io, file);
-    var result = try tree.find("KA", &storage);
+    var tree: Tree = .load(allocator, io, file);
+    defer tree.deinit();
+
+    var result = try tree.find("KA");
     try std.testing.expectEqualStrings("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", result.cell.?.val());
-    result = try tree.find("KB", &storage);
+    result = try tree.find("KB");
     try std.testing.expectEqualStrings("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", result.cell.?.val());
-    result = try tree.find("KC", &storage);
+    result = try tree.find("KC");
     try std.testing.expectEqualStrings("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", result.cell.?.val());
-    result = try tree.find("blah", &storage);
+    result = try tree.find("blah");
     try std.testing.expect(result.cell == null);
 }
 
 test {
     const io = std.testing.io;
+    const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
     var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
 
-    var root: PageBuffer = .new(&storage);
+    var root: PageBuffer = .new(&storage, 0);
     root.header().* = .empty(.leaf);
     try file.writePositionalAll(io, &storage, 0);
 
-    storage = undefined;
-    var tree: Tree = .load(io, file);
+    var tree: Tree = .load(allocator, io, file);
+    defer tree.deinit();
 
-    try tree.insert("1", "one", &storage);
-    try file.writePositionalAll(io, &storage, 0);
-    try tree.insert("3", "three", &storage);
-    try file.writePositionalAll(io, &storage, 0);
-    try tree.insert("2", "two", &storage);
-    try file.writePositionalAll(io, &storage, 0);
+    try tree.insert("1", "one");
+    try tree.insert("3", "three");
+    try tree.insert("2", "two");
 
-    var result = try tree.find("1", &storage);
+    var result = try tree.find("1");
     try std.testing.expectEqualStrings("one", result.cell.?.val());
-    result = try tree.find("2", &storage);
+    result = try tree.find("2");
     try std.testing.expectEqualStrings("two", result.cell.?.val());
-    result = try tree.find("3", &storage);
+    result = try tree.find("3");
     try std.testing.expectEqualStrings("three", result.cell.?.val());
 
     try expectValidTree(&tree);
@@ -505,18 +631,13 @@ test {
 
 test "insert random keys" {
     const io = std.testing.io;
+    const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
-    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
-
-    var root: PageBuffer = .new(&storage);
-    root.header().* = .empty(.leaf);
-    try file.writePositionalAll(io, &storage, 0);
-
-    storage = undefined;
-    var tree: Tree = .load(io, file);
+    var tree: Tree = try .empty(allocator, io, file);
+    defer tree.deinit();
 
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     const random = prng.random();
@@ -524,8 +645,7 @@ test "insert random keys" {
     for (0..100) |_| {
         var key: [10]u8 = undefined;
         random.bytes(&key);
-        try tree.insert(&key, "one", &storage);
-        try file.writePositionalAll(io, &storage, 0);
+        try tree.insert(&key, "one");
     }
 
     try expectValidTree(&tree);
@@ -540,6 +660,7 @@ test "insert random keys" {
 // [1, 2] [3, 4]  [5, 6]  [7, 8]    [9, 10]     page = 3, 4, 5, 6, 7
 test "some tree" {
     const io = std.testing.io;
+    const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
@@ -551,7 +672,7 @@ test "some tree" {
     var temp_page_id: PageId = 1;
     var cell: Cell = .raw(&test_cell);
     cell.from_keyval("7", @ptrCast(&temp_page_id));
-    var page: PageBuffer = .new(&buf);
+    var page: PageBuffer = .new(&buf, 0);
     page.header().* = .empty(.internal);
     page.header().right_pointer = 2;
     page.append_cell(&test_cell);
@@ -559,7 +680,7 @@ test "some tree" {
 
     // [3, 5]
     buf = undefined;
-    page = .new(&buf);
+    page = .new(&buf, 1);
     page.header().* = .empty(.internal);
     page.header().right_pointer = 5;
 
@@ -579,7 +700,7 @@ test "some tree" {
 
     // [9]
     buf = undefined;
-    page = .new(&buf);
+    page = .new(&buf, 2);
     page.header().* = .empty(.internal);
     page.header().right_pointer = 7;
 
@@ -592,7 +713,7 @@ test "some tree" {
 
     // [1, 2]
     buf = undefined;
-    page = .new(&buf);
+    page = .new(&buf, 3);
     page.header().* = .empty(.leaf);
 
     test_cell = undefined;
@@ -609,7 +730,7 @@ test "some tree" {
 
     // [3, 4]
     buf = undefined;
-    page = .new(&buf);
+    page = .new(&buf, 4);
     page.header().* = .empty(.leaf);
 
     test_cell = undefined;
@@ -626,7 +747,7 @@ test "some tree" {
 
     // [5, 6]
     buf = undefined;
-    page = .new(&buf);
+    page = .new(&buf, 5);
     page.header().* = .empty(.leaf);
 
     test_cell = undefined;
@@ -643,7 +764,7 @@ test "some tree" {
 
     // [7, 8]
     buf = undefined;
-    page = .new(&buf);
+    page = .new(&buf, 6);
     page.header().* = .empty(.leaf);
 
     test_cell = undefined;
@@ -660,7 +781,7 @@ test "some tree" {
 
     // [9, 10]
     buf = undefined;
-    page = .new(&buf);
+    page = .new(&buf, 7);
     page.header().* = .empty(.leaf);
 
     test_cell = undefined;
@@ -675,26 +796,26 @@ test "some tree" {
 
     try file.writePositionalAll(io, &buf, 7 * page_size);
 
-    var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
-    var tree: Tree = .load(io, file);
+    var tree: Tree = .load(allocator, io, file);
+    defer tree.deinit();
 
     try expectValidTree(&tree);
 
-    var result = try tree.find("1", &storage);
+    var result = try tree.find("1");
     try std.testing.expectEqualStrings("one", result.cell.?.val());
-    result = try tree.find("2", &storage);
+    result = try tree.find("2");
     try std.testing.expectEqualStrings("two", result.cell.?.val());
-    result = try tree.find("3", &storage);
+    result = try tree.find("3");
     try std.testing.expectEqualStrings("three", result.cell.?.val());
-    result = try tree.find("4", &storage);
+    result = try tree.find("4");
     try std.testing.expectEqualStrings("four", result.cell.?.val());
-    result = try tree.find("5", &storage);
+    result = try tree.find("5");
     try std.testing.expectEqualStrings("five", result.cell.?.val());
-    result = try tree.find("6", &storage);
+    result = try tree.find("6");
     try std.testing.expectEqualStrings("six", result.cell.?.val());
-    result = try tree.find("7", &storage);
+    result = try tree.find("7");
     try std.testing.expectEqualStrings("seven", result.cell.?.val());
-    result = try tree.find("8", &storage);
+    result = try tree.find("8");
     try std.testing.expectEqualStrings("eight", result.cell.?.val());
     // fails because 10 is less than 9 lexically, i should use alphabet or stop at 9
     //try std.testing.expectEqualStrings("nine", (try tree.find("9", &storage)).?);
