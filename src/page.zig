@@ -73,7 +73,7 @@ pub const PageCache = struct {
     }
 
     fn load_page(self: *Self, id: PageId) !*PageBuffer {
-        // TODO: should page buf be a fixed array inside PageBuffer? 
+        // TODO: should page buf be a fixed array inside PageBuffer?
         //       it would allow us to do a single allocation.
         const page_buf = try self.allocator.alloc(u8, page_size);
         const page = try self.allocator.create(PageBuffer);
@@ -96,16 +96,11 @@ pub const PageCache = struct {
         page.is_dirty = true;
     }
 
-    /// Write back all dirty pages.
-    pub fn writeback(self: *Self) !void {
-        // TODO: consecutive blocks can be written as a single operation.
-        var it = self.cache.iterator();
-        while (it.next()) |entry| {
-            var page: *PageBuffer = entry.value_ptr.*;
-            const id = entry.key_ptr.*;
-            _ = try self.file.writePositionalAll(self.io, page.inner, id * page_size);
-            page.is_dirty = false;
-        }
+    inline fn writeback_page(self: *Self, page: *PageBuffer) void {
+        self.file.writePositionalAll(self.io, page.inner, page.page_id * page_size) catch {
+            @panic("writeback failed");
+        };
+        page.is_dirty = false;
     }
 
     /// TODO: i'm not sure if this is the right API and if it belongs in PageCache
@@ -121,6 +116,16 @@ pub const PageCache = struct {
         return id;
     }
 
+    /// Get a page buffer.
+    ///
+    /// # Example
+    ///
+    /// ```zig
+    /// const result = try page_cache.get(page_id);
+    /// const page = result orelse return null;
+    /// defer page_cache.put(page);
+    /// // modify the page
+    /// ```
     pub fn get(self: *Self, id: PageId) !?*PageBuffer {
         const result = try self.cache.getOrPut(id);
         if (!result.found_existing) {
@@ -131,21 +136,21 @@ pub const PageCache = struct {
 
         return result.value_ptr.*;
     }
-    
+
+    pub fn put(self: *Self, page: *PageBuffer) void {
+        const old_refcnt = page.refcnt.fetchSub(1, .monotonic);
+        if (old_refcnt == 1) {
+            self.writeback_page(page);
+            self.allocator.free(page.inner);
+            self.allocator.destroy(page);
+        }
+    }
+
     /// This will writeback all dirty pages, and free *all* page buffers.
     pub fn deinit(self: *Self) void {
-        // TODO: writeback failing should be safe, since we will have WAL (later)
-        self.writeback() catch {};
         var it = self.cache.iterator();
         while (it.next()) |entry| {
-            // if the page buffer is not referenced, then it's our responsiblity
-            // to free it.
-            // TODO: but then, a "put" operation must be provided, it does not make sense
-            //          to deinit the tree and still have page references.
-            //if (entry.value_ptr.*.refcnt.load(.monotonic) == 0) {
-                self.allocator.free(entry.value_ptr.*.inner);
-                self.allocator.destroy(entry.value_ptr.*);
-            //}
+            self.put(entry.value_ptr.*);
         }
         self.cache.deinit();
     }
@@ -168,9 +173,9 @@ test PageCache {
 pub const PageBuffer = struct {
     const Self = @This();
     inner: []u8,
-    // TODO: for when I make the db concurrent
     // This should not be accessed directly, only by the page cache.
-    refcnt: std.atomic.Value(usize) = .init(0),
+    // Initial value is *1* because it's referenced by the page cache.
+    refcnt: std.atomic.Value(usize) = .init(1),
     // Whether the page has been modified and is out of sync with disk.
     is_dirty: bool = false,
     page_id: PageId,
@@ -317,6 +322,8 @@ pub const Tree = struct {
         tree.root_page_id = root_id;
 
         var root_page = (try tree.page_cache.get(root_id)).?;
+        defer tree.page_cache.put(root_page);
+
         root_page.header().* = .empty(.leaf);
         try tree.page_cache.mark_page_dirty(root_id);
 
@@ -339,6 +346,8 @@ pub const Tree = struct {
         var upper_bound_idx: ?usize = null;
         nodes_loop: while (true) {
             page = (try self.page_cache.get(page_id)).?;
+            defer self.page_cache.put(page);
+
             header = page.header();
             upper_bound_idx = null;
 
@@ -468,6 +477,7 @@ pub fn expectValidTreeNode(
     page_id: PageId,
 ) !validPageResult {
     var page: *PageBuffer = (try tree.page_cache.get(page_id)).?;
+    defer tree.page_cache.put(page);
 
     // 1. root.pointers() is sorted
     // 2. max_key(child[N]) < key[N]
@@ -623,7 +633,7 @@ test "insert random keys" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
-    //defer tmp.cleanup();
+    defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
     var tree: Tree = try .empty(allocator, io, file);
