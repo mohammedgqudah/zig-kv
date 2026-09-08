@@ -118,10 +118,13 @@ pub const Cell = struct {
     }
 };
 
+/// Raw bytes for a page.
+pub const PageBytes = []align(@alignOf(PageHeader)) u8;
+
 /// A wrapper around the page bytes
 pub const PageBuffer = struct {
     const Self = @This();
-    inner: []u8,
+    inner: PageBytes,
     // This should not be accessed directly, only by the page cache.
     // Initial value is *1* because it's referenced by the page cache.
     refcnt: std.atomic.Value(usize) = .init(1),
@@ -129,7 +132,7 @@ pub const PageBuffer = struct {
     is_dirty: bool = false,
     page_id: PageId,
 
-    pub fn new(buffer: []u8, id: PageId) Self {
+    pub fn new(buffer: PageBytes, id: PageId) Self {
         assert(buffer.len == page_size);
 
         return .{
@@ -182,6 +185,7 @@ pub const PageBuffer = struct {
 /// The result returned by a btree lookup.
 /// Lookup will stop when a leaf node is found and optionally the key is found.
 pub const FindResult = struct {
+    /// The lifetime of the cell is tied to the page buffer
     cell: ?Cell,
     page: *PageBuffer,
     /// Index of the pointer that points to key upper bound in page.
@@ -222,53 +226,36 @@ pub const Tree = struct {
     pub fn find(self: *Self, key: []const u8) !FindResult {
         var page_id: u64 = self.root_page_id;
 
-        var page: *PageBuffer = undefined;
-        var header: *PageHeader = undefined;
-        var upper_bound_idx: ?usize = null;
-        nodes_loop: while (true) {
-            page = (try self.page_cache.get(page_id)).?;
-            defer self.page_cache.put(page);
-
-            header = page.header();
-            upper_bound_idx = null;
-
+        while (true) {
+            var next_page_id: ?PageId = null;
+            const page = (try self.page_cache.get(page_id)).?;
+            const header = page.header();
+            var upper_bound_idx: ?usize = null;
             var low: usize = 0;
             var high: usize = page.pointers().len;
-            if (high == 0) {
-                // reached empty node.
-                std.debug.print("empty node!!\n", .{});
-                break :nodes_loop;
-            }
+
+            if (high == 0)
+                return .{ .cell = null, .page = page, .upper_bound_idx = null };
+
             while (low < high) {
                 const mid = low + (high - low) / 2;
                 const midOffset: CellOffset = page.pointers()[mid];
                 var cell: Cell = page.cell(midOffset);
-                std.debug.print("mid = {d}\n", .{mid});
-                std.debug.print("offset = 0x{x}\n", .{midOffset});
-                std.debug.print("cell val = {s}\n", .{cell.val()});
                 switch (mem.order(u8, key, cell.key())) {
                     .eq => {
                         switch (header.type) {
                             .internal => {
                                 if (mid + 1 >= page.pointers().len) {
-                                    page_id = page.header().right_pointer;
-                                    std.debug.print("going rigt! {s}\n", .{key});
-                                    continue :nodes_loop;
+                                    next_page_id = page.header().right_pointer;
+                                } else {
+                                    const offset = page.pointers()[mid + 1];
+                                    cell = page.cell(offset);
+                                    next_page_id = mem.readInt(u64, @ptrCast(cell.val()), .little);
                                 }
-                                const offset = page.pointers()[mid + 1];
-                                cell = page.cell(offset);
-                                page_id = mem.readInt(u64, @ptrCast(cell.val()), .little);
-                                // exact match found at internal node
-                                // next pointer is the upper bound.
-                                continue :nodes_loop;
+                                break;
                             },
                             .leaf => {
-                                std.debug.print("equal! {s}\n", .{key});
-                                return .{
-                                    .cell = cell,
-                                    .page = page,
-                                    .upper_bound_idx = upper_bound_idx,
-                                };
+                                return .{ .cell = cell, .page = page, .upper_bound_idx = upper_bound_idx };
                             },
                         }
                     },
@@ -280,13 +267,24 @@ pub const Tree = struct {
                 }
             }
 
-            // loop ended, either:
-            // 1. key is greater than all keys -> use right pointer
-            // 2. upper bound found
-            // 3. we reached a leaf -> key doesn't exist
-            if (header.type == .leaf) {
-                break :nodes_loop;
+            // binary search ended
+            if (next_page_id) |id| {
+                self.page_cache.put(page);
+                page_id = id;
+                continue;
             }
+            // if binary search couldn't find a "next_page" pointer to follow
+            // and this is a leaf node, then we reached the bottom of the tree 
+            // and there are no more pointers to follow
+            if (page.header().type == .leaf) {
+                return .{
+                    .cell = null,
+                    .page = page,
+                    .upper_bound_idx = upper_bound_idx,
+                };
+            }
+
+            // follow the upper bound
             if (upper_bound_idx) |idx| {
                 const offset = page.pointers()[idx];
                 var cell = page.cell(offset);
@@ -295,12 +293,7 @@ pub const Tree = struct {
                 page_id = page.header().right_pointer;
             }
         }
-
-        return .{
-            .cell = null,
-            .page = page,
-            .upper_bound_idx = upper_bound_idx,
-        };
+        @panic("unreachable");
     }
 
     pub fn insert(
@@ -310,6 +303,8 @@ pub const Tree = struct {
     ) !void {
         var find_result = try self.find(key);
         var page: *PageBuffer = find_result.page;
+        defer self.page_cache.put(page);
+
         if (find_result.cell != null)
             return error.KeyAlreadyExists;
 
@@ -362,7 +357,11 @@ pub const PageCache = struct {
     fn load_page(self: *Self, id: PageId) !*PageBuffer {
         // TODO: should page buf be a fixed array inside PageBuffer?
         //       it would allow us to do a single allocation.
-        const page_buf = try self.allocator.alloc(u8, page_size);
+        const page_buf = try self.allocator.alignedAlloc(
+            u8,
+            .of(PageHeader),
+            page_size,
+        );
         const page = try self.allocator.create(PageBuffer);
         errdefer {
             self.allocator.free(page_buf);

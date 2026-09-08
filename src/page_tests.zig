@@ -18,9 +18,11 @@ const mem = std.mem;
 const fmt = std.fmt;
 const assert = std.debug.assert;
 
+const test_allocator = std.heap.page_allocator;
+
 test PageCache {
     const io = std.testing.io;
-    const allocator = std.testing.allocator;
+    const allocator = test_allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -39,7 +41,7 @@ const validPageResult = struct {
 pub fn expectValidTree(tree: *Tree) !void {
     if (!builtin.is_test) @compileError("expectValidTree is only allowed in testing");
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(test_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
@@ -138,8 +140,8 @@ pub fn expectValidTreeNode(
 
 test "it finds keys in a leaf root node" {
     const io = std.testing.io;
-    const allocator = std.testing.allocator;
-    const gpa = std.testing.allocator;
+    const allocator = test_allocator;
+    const gpa = test_allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
@@ -176,7 +178,7 @@ test "it finds keys in a leaf root node" {
 
 test {
     const io = std.testing.io;
-    const allocator = std.testing.allocator;
+    const allocator = test_allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
@@ -200,13 +202,15 @@ test {
     try std.testing.expectEqualStrings("two", result.cell.?.val());
     result = try tree.find("3");
     try std.testing.expectEqualStrings("three", result.cell.?.val());
+    result = try tree.find("5");
+    try testing.expect(result.cell == null);
 
     try expectValidTree(&tree);
 }
 
 test "insert random keys" {
     const io = std.testing.io;
-    const allocator = std.testing.allocator;
+    const allocator = test_allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
@@ -235,7 +239,7 @@ test "insert random keys" {
 // [1, 2] [3, 4]  [5, 6]  [7, 8]    [9, 10]     page = 3, 4, 5, 6, 7
 test "some tree" {
     const io = std.testing.io;
-    const allocator = std.testing.allocator;
+    const allocator = test_allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
