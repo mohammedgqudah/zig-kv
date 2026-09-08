@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
+const config = @import("config");
 
 const Io = std.Io;
 const mem = std.mem;
@@ -210,7 +211,7 @@ pub const Tree = struct {
         defer tree.page_cache.put(root_page);
 
         root_page.header().* = .empty(.leaf);
-        try tree.page_cache.mark_page_dirty(root_id);
+        tree.page_cache.mark_page_dirty(root_page);
 
         return tree;
     }
@@ -274,7 +275,7 @@ pub const Tree = struct {
                 continue;
             }
             // if binary search couldn't find a "next_page" pointer to follow
-            // and this is a leaf node, then we reached the bottom of the tree 
+            // and this is a leaf node, then we reached the bottom of the tree
             // and there are no more pointers to follow
             if (page.header().type == .leaf) {
                 return .{
@@ -324,7 +325,7 @@ pub const Tree = struct {
         page.pointers()[insert_idx] = page.header().upper;
         var cell: Cell = .raw(page.inner[page.header().upper..].ptr);
         cell.from_keyval(key, value);
-        try self.page_cache.mark_page_dirty(page.page_id);
+        self.page_cache.mark_page_dirty(page);
     }
 
     pub fn deinit(self: *Self) void {
@@ -377,8 +378,8 @@ pub const PageCache = struct {
         return page;
     }
 
-    pub fn mark_page_dirty(self: *Self, id: PageId) !void {
-        var page: *PageBuffer = self.cache.get(id) orelse return error.PageNotFound;
+    pub fn mark_page_dirty(self: *Self, page: *PageBuffer) void {
+        _ = self;
         page.is_dirty = true;
     }
 
@@ -413,7 +414,11 @@ pub const PageCache = struct {
     /// // modify the page
     /// ```
     pub fn get(self: *Self, id: PageId) !?*PageBuffer {
+        if (config.disable_page_cache) {
+            return self.load_page(id);
+        }
         const result = try self.cache.getOrPut(id);
+
         if (!result.found_existing) {
             errdefer _ = self.cache.remove(id);
             result.value_ptr.* = try self.load_page(id);
@@ -432,7 +437,7 @@ pub const PageCache = struct {
         }
     }
 
-    /// This will writeback all dirty pages, and free *all* page buffers.
+    /// Drop page cace references to page buffers and deinit the hashmap.
     pub fn deinit(self: *Self) void {
         var it = self.cache.iterator();
         while (it.next()) |entry| {

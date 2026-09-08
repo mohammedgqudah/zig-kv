@@ -31,6 +31,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const options = b.addOptions();
+    options.addOption(bool, "disable_page_cache", false);
+
+    exe.root_module.addOptions("config", options);
+
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
@@ -42,18 +47,48 @@ pub fn build(b: *std.Build) void {
 
     run_cmd.addPassthruArgs();
 
-    const mod_tests = b.addTest(.{
-        .root_module = mod,
-    });
+    // tests
 
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-
-    const run_exe_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
+
+    // page cache enabled
+    const options_enabled = b.addOptions();
+    options_enabled.addOption(bool, "disable_page_cache", false);
+    const module_enabled = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = exe.root_module.resolved_target,
+        .optimize = exe.root_module.optimize,
+    });
+    module_enabled.addOptions("config", options_enabled);
+    const tests_cache_enabled = b.addTest(.{
+        .root_module = module_enabled,
+    });
+    const run_tests_cache_enabled = b.addRunArtifact(tests_cache_enabled);
+    const enabled_step = b.step(
+        "test-cache-enabled",
+        "Run tests with page cache enabled",
+    );
+    enabled_step.dependOn(&run_tests_cache_enabled.step);
+
+    // page cache disabled
+    const options_disabled = b.addOptions();
+    options_disabled.addOption(bool, "disable_page_cache", true);
+    const module_disabled = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = exe.root_module.resolved_target,
+        .optimize = exe.root_module.optimize,
+    });
+    module_disabled.addOptions("config", options_disabled);
+    const tests_cache_disabled = b.addTest(.{
+        .root_module = module_disabled,
+    });
+    const run_tests_cache_disabled = b.addRunArtifact(tests_cache_disabled);
+    const disabled_step = b.step(
+        "test-cache-disabled",
+        "Run tests with page cache disabled",
+    );
+    disabled_step.dependOn(&run_tests_cache_disabled.step);
+
+    test_step.dependOn(enabled_step);
+    test_step.dependOn(disabled_step);
 }
