@@ -18,7 +18,7 @@ const mem = std.mem;
 const fmt = std.fmt;
 const assert = std.debug.assert;
 
-const test_allocator = std.heap.page_allocator;
+const test_allocator = std.testing.allocator;
 
 test PageCache {
     const io = std.testing.io;
@@ -168,11 +168,18 @@ test "it finds keys in a leaf root node" {
 
     var result = try tree.find("KA");
     try std.testing.expectEqualStrings("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("KB");
     try std.testing.expectEqualStrings("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("KC");
     try std.testing.expectEqualStrings("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("blah");
+    tree.page_cache.put(result.page);
     try std.testing.expect(result.cell == null);
 }
 
@@ -198,12 +205,19 @@ test {
 
     var result = try tree.find("1");
     try std.testing.expectEqualStrings("one", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("2");
     try std.testing.expectEqualStrings("two", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("3");
     try std.testing.expectEqualStrings("three", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("5");
     try testing.expect(result.cell == null);
+    tree.page_cache.put(result.page);
 
     try expectValidTree(&tree);
 }
@@ -382,20 +396,35 @@ test "some tree" {
 
     var result = try tree.find("1");
     try std.testing.expectEqualStrings("one", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("2");
     try std.testing.expectEqualStrings("two", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("3");
     try std.testing.expectEqualStrings("three", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("4");
     try std.testing.expectEqualStrings("four", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("5");
     try std.testing.expectEqualStrings("five", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("6");
     try std.testing.expectEqualStrings("six", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("7");
     try std.testing.expectEqualStrings("seven", result.cell.?.val());
+    tree.page_cache.put(result.page);
+
     result = try tree.find("8");
     try std.testing.expectEqualStrings("eight", result.cell.?.val());
+    tree.page_cache.put(result.page);
     // fails because 10 is less than 9 lexically, i should use alphabet or stop at 9
     //try std.testing.expectEqualStrings("nine", (try tree.find("9", &storage)).?);
 }

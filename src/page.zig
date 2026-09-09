@@ -268,15 +268,7 @@ pub const Tree = struct {
                 }
             }
 
-            // binary search ended
-            if (next_page_id) |id| {
-                self.page_cache.put(page);
-                page_id = id;
-                continue;
-            }
-            // if binary search couldn't find a "next_page" pointer to follow
-            // and this is a leaf node, then we reached the bottom of the tree
-            // and there are no more pointers to follow
+            // we reached the bottom of the tree and there are no more pointers to follow
             if (page.header().type == .leaf) {
                 return .{
                     .cell = null,
@@ -285,14 +277,16 @@ pub const Tree = struct {
                 };
             }
 
-            // follow the upper bound
-            if (upper_bound_idx) |idx| {
+            if (next_page_id) |id| {
+                page_id = id;
+            } else if (upper_bound_idx) |idx| {
                 const offset = page.pointers()[idx];
                 var cell = page.cell(offset);
                 page_id = mem.readInt(u64, @ptrCast(cell.val()), .little);
             } else {
                 page_id = page.header().right_pointer;
             }
+            self.page_cache.put(page);
         }
         @panic("unreachable");
     }
