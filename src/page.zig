@@ -95,7 +95,6 @@ pub const Cell = struct {
 
     /// The *entire* cell length.
     pub fn len(self: *Self) usize {
-        std.debug.print("key size = {d}\n", .{self.key_size()});
         return self.key_size() + self.val_size() + @sizeOf(u64) * 2;
     }
 
@@ -180,6 +179,22 @@ pub const PageBuffer = struct {
         head.lower += @sizeOf(CellOffset);
         self.pointers()[ptr_idx] = head.upper;
         @memcpy(self.inner[head.upper .. head.upper + record.len], record);
+    }
+
+    pub fn format(
+        self: *Self,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try writer.print(
+            "PageBuffer{{ page={}, ref_count={}, dirty={} }} @ {*}\n",
+            .{
+                self.page_id,
+                self.refcnt.load(.monotonic),
+                self.is_dirty,
+                self,
+            },
+        );
+        try writer.print("   inner @ {*}\n", .{self.inner.ptr});
     }
 };
 
@@ -329,6 +344,7 @@ pub const Tree = struct {
         const value: []const u8 = @ptrCast(&_value);
         const page = (try self.page_cache.get(parent_page_id)).?;
 
+        std.debug.print("available space in parent: {d}\n", .{page.header().freeSpace()});
         // now, figure out where to insert
         const expected_size = key.len + value.len + @sizeOf(u64) * 2;
         if (page.header().freeSpace() < expected_size + @sizeOf(CellOffset)) {
@@ -361,18 +377,22 @@ pub const Tree = struct {
         //      we should find upper bound for parent (current) page too.
         // shift pointers to right (starting from upper bound)
         const insert_idx = upper_bound_idx orelse page.pointers().len;
-        if (insert_idx != page.pointers().len) {
-            @memmove(page.pointers().ptr[0 .. page.pointers().len + 1][insert_idx + 1 ..], page.pointers()[insert_idx..]);
-        }
+        std.debug.print("separator insert index: {d} @ page {d} @ {*}\n", .{ insert_idx, parent_page_id, page });
+        //if (insert_idx != page.pointers().len) {
+        //    @memmove(page.pointers().ptr[0 .. page.pointers().len + 1][insert_idx + 1 ..], page.pointers()[insert_idx..]);
+        //}
         page.header().number_of_cells += 1;
         page.header().upper -= expected_size;
         page.header().lower += @sizeOf(CellOffset);
         page.pointers()[insert_idx] = page.header().upper;
-        var cell: Cell = .raw(page.inner[page.header().upper..].ptr);
+        //var cell: Cell = .raw(page.inner[page.header().upper..].ptr);
+        var cell = page.cell(page.offset(insert_idx));
         cell.from_keyval(key, value);
         if (insert_idx + 1 == page.pointers().len) {
+            std.debug.print("assigning right pointer\n", .{});
             page.header().right_pointer = new_page_id;
         } else {
+            std.debug.print("updating pointer to the right\n", .{});
             const p: []const u8 = @ptrCast(&new_page_id);
             var after_cell = page.cell(page.offset(insert_idx + 1));
             @memcpy(after_cell.val(), p);
@@ -385,28 +405,30 @@ pub const Tree = struct {
     /// is the right half.
     ///
     /// The caller is responsible for updating the parent pointers.
-    /// 
+    ///
     /// left: [0..split_idx)
     /// right: [split_idx..]
     ///
     /// [1, 3, 4, 5, 6, 7]
-    /// 
+    ///
     /// left: [1, 3, 4]
     /// right: [5, 6, 7]
     pub fn split_page(self: *Self, page: *PageBuffer) !*PageBuffer {
+        std.debug.print("splitting page {d}\n", .{page.page_id});
         const new_page_id = try self.page_cache.allocate();
         const new_page = try self.page_cache.get(new_page_id) orelse @panic("unreachable");
         new_page.header().* = .empty(page.header().type);
         const split_index = page.pointers().len / 2;
         // fill new page
         for (page.pointers()[split_index..], 0..) |offset, idx| {
+            var old_cell = page.cell(offset);
+
             new_page.header().number_of_cells += 1;
             new_page.header().lower += @sizeOf(CellOffset);
+            new_page.header().upper -= old_cell.len();
             new_page.pointers()[idx] = page.header().upper;
 
-            var old_cell = page.cell(offset);
             var new_cell = new_page.cell(new_page.header().upper);
-            new_page.header().upper -= old_cell.len();
             new_cell.from_keyval(old_cell.key(), old_cell.val());
 
             page.header().number_of_cells -= 1;
@@ -424,14 +446,20 @@ pub const Tree = struct {
     ) !void {
         var find_result = try self._find(key, .{ .track_path = true });
         var page: *PageBuffer = find_result.page;
-        defer self.page_cache.put(page);
-        defer find_result.path.?.deinit(self.allocator);
+        var target_page: *PageBuffer = page;
+        defer {
+            if (target_page.page_id != page.page_id) {
+                // free new page
+                self.page_cache.put(target_page);
+            }
+            self.page_cache.put(page);
+            find_result.path.?.deinit(self.allocator);
+        }
 
         if (find_result.cell != null)
             return error.KeyAlreadyExists;
 
         // TODO: page and index to insert in, could change if we split
-        var target_page: *PageBuffer = page;
         var insert_idx = find_result.upper_bound_idx orelse page.pointers().len;
 
         // now, figure out where to insert
@@ -450,9 +478,15 @@ pub const Tree = struct {
                 if (path.pop()) |id| break :parent_id id;
                 const new_root_id = try self.page_cache.allocate();
                 var new_root = (try self.page_cache.get(new_root_id)).?;
+                defer self.page_cache.put(new_root); // <- why does leaking cause inconsisntecy
                 new_root.header().* = .empty(.internal);
+                std.debug.print("new root: {d}, space= {d}\n", .{
+                    new_root.page_id,
+                    new_root.header().freeSpace(),
+                });
                 break :parent_id new_root_id;
             };
+            std.debug.print("parent _id={d}\n", .{parent_id});
             try self.insert_separator(
                 parent_id,
                 page.page_id,
@@ -462,13 +496,13 @@ pub const Tree = struct {
             );
         }
 
-        if (find_result.upper_bound_idx) |idx| {
-            // shift pointers to right (starting from upper bound)
-            @memmove(
-                target_page.pointers().ptr[0 .. target_page.pointers().len + 1][idx + 1 ..],
-                target_page.pointers()[idx..],
-            );
-        }
+        // shift pointers to right (starting from upper bound)
+        const pointers = target_page.pointers();
+        @memmove(
+            pointers.ptr[insert_idx + 1 .. pointers.len + 1],
+            pointers[insert_idx..],
+        );
+
         target_page.header().number_of_cells += 1;
         target_page.header().upper -= expected_size;
         target_page.header().lower += @sizeOf(CellOffset);
@@ -591,6 +625,9 @@ pub const PageCache = struct {
     pub fn deinit(self: *Self) void {
         var it = self.cache.iterator();
         while (it.next()) |entry| {
+            std.debug.print("freeing page: \n{f}\n", .{
+                entry.value_ptr.*,
+            });
             self.put(entry.value_ptr.*);
         }
         self.cache.deinit();

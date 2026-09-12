@@ -45,7 +45,9 @@ pub fn expectValidTree(tree: *Tree) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
+    std.debug.print("== tree ==\n ", .{});
     _ = try expectValidTreeNode(allocator, tree, tree.root_page_id);
+    std.debug.print("== //tree == \n", .{});
 }
 
 pub fn expectValidTreeNode(
@@ -53,6 +55,7 @@ pub fn expectValidTreeNode(
     tree: *Tree,
     page_id: PageId,
 ) !validPageResult {
+    std.debug.print("NODE\n", .{});
     var page: *PageBuffer = (try tree.page_cache.get(page_id)).?;
     defer tree.page_cache.put(page);
 
@@ -235,11 +238,13 @@ test "insert random keys" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     const random = prng.random();
 
-    for (0..100) |_| {
+    std.debug.print("random1 == \n", .{});
+    for (0..110) |_| {
         var key: [10]u8 = undefined;
         random.bytes(&key);
         try tree.insert(&key, "one");
     }
+    std.debug.print("== /random == \n", .{});
 
     try expectValidTree(&tree);
 }
