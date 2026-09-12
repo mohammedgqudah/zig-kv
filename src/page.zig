@@ -374,14 +374,16 @@ pub const Tree = struct {
             }
         }
 
-        // TODO: pointers.len is wrong when we're a key into a parent, and not in a found page directly.
-        //      we should find upper bound for parent (current) page too.
-        // shift pointers to right (starting from upper bound)
         const insert_idx = upper_bound_idx orelse page.pointers().len;
         std.debug.print("separator insert index: {d} @ page {d} @ {*}\n", .{ insert_idx, parent_page_id, page });
-        //if (insert_idx != page.pointers().len) {
-        //    @memmove(page.pointers().ptr[0 .. page.pointers().len + 1][insert_idx + 1 ..], page.pointers()[insert_idx..]);
-        //}
+        // shift pointers to right to inesrt new separator
+        const old_len = page.header().number_of_cells;
+        if (insert_idx < old_len) {
+            @memmove(
+                page.pointers().ptr[insert_idx + 1 .. old_len + 1],
+                page.pointers()[insert_idx..old_len],
+            );
+        }
         page.header().number_of_cells += 1;
         page.header().upper -= expected_size;
         page.header().lower += @sizeOf(CellOffset);
@@ -431,11 +433,21 @@ pub const Tree = struct {
 
             var new_cell = new_page.cell(new_page.header().upper);
             new_cell.from_keyval(old_cell.key(), old_cell.val());
-
-            page.header().number_of_cells -= 1;
-            page.header().lower -= @sizeOf(CellOffset);
-            page.header().upper += new_cell.len();
         }
+
+        // rewrite the old page (left half) and shrink it.
+        var scratch: [page_size]u8 = undefined;
+        var new_upper: usize = page_size;
+        for (page.pointers()[0..split_index], 0..) |offset, idx| {
+            var cell = page.cell(offset);
+            new_upper -= cell.len();
+            @memcpy(scratch[new_upper..][0..cell.len()], cell.as_slice());
+            page.pointers()[idx] = new_upper;
+        }
+        @memcpy(page.inner[new_upper..page_size], scratch[new_upper..page_size]);
+        page.header().number_of_cells = split_index;
+        page.header().lower = @sizeOf(PageHeader) + split_index * @sizeOf(CellOffset);
+        page.header().upper = new_upper;
 
         return new_page;
     }
@@ -450,7 +462,6 @@ pub const Tree = struct {
         var target_page: *PageBuffer = page;
         defer {
             if (target_page.page_id != page.page_id) {
-                // free new page
                 self.page_cache.put(target_page);
             }
             self.page_cache.put(page);
@@ -481,6 +492,8 @@ pub const Tree = struct {
             if (insert_idx >= split_index) {
                 target_page = new_page;
                 insert_idx -= split_index;
+            } else {
+                self.page_cache.put(new_page);
             }
             _ = path.pop(); // old leaf id
             const parent_id = parent_id: {

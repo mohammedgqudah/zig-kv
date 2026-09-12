@@ -252,7 +252,7 @@ test "insert random keys" {
     defer values.deinit();
 
     std.debug.print("random1 == \n", .{});
-    for (0..110) |_| {
+    for (0..200) |_| {
         var key: [10]u8 = undefined;
         random.bytes(&key);
         //fillAlphanumericAndUnderscore(random, &key);
