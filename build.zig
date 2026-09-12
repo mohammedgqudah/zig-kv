@@ -49,6 +49,11 @@ pub fn build(b: *std.Build) void {
 
     // tests
 
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Skip tests that do not match any filter",
+    ) orelse &[0][]const u8{};
     const test_step = b.step("test", "Run tests");
 
     // page cache enabled
@@ -62,6 +67,7 @@ pub fn build(b: *std.Build) void {
     module_enabled.addOptions("config", options_enabled);
     const tests_cache_enabled = b.addTest(.{
         .root_module = module_enabled,
+        .filters = test_filters,
     });
     const run_tests_cache_enabled = b.addRunArtifact(tests_cache_enabled);
     const enabled_step = b.step(
@@ -81,6 +87,7 @@ pub fn build(b: *std.Build) void {
     module_disabled.addOptions("config", options_disabled);
     const tests_cache_disabled = b.addTest(.{
         .root_module = module_disabled,
+        .filters = test_filters,
     });
     const run_tests_cache_disabled = b.addRunArtifact(tests_cache_disabled);
     const disabled_step = b.step(
