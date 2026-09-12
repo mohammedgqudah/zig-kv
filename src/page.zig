@@ -485,6 +485,7 @@ pub const Tree = struct {
                     new_root.page_id,
                     new_root.header().freeSpace(),
                 });
+                self.root_page_id = new_root.page_id;
                 break :parent_id new_root_id;
             };
             std.debug.print("parent _id={d}\n", .{parent_id});

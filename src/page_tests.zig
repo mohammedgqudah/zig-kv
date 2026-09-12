@@ -76,8 +76,8 @@ pub fn expectValidTreeNode(
                     .{
                         page_id,
                         idx,
-                        prev_cell.key(),
-                        current_cell.key(),
+                        prev_cell.key()[0..10],
+                        current_cell.key()[0..10],
                     },
                 );
                 return error.InvalidPointers;
@@ -225,9 +225,19 @@ test {
     try expectValidTree(&tree);
 }
 
+pub fn fillAlphanumericAndUnderscore(random: std.Random, slice: []u8) void {
+    const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+    for (slice) |*b| b.* = charset[random.uintLessThan(usize, charset.len)];
+}
+
 test "insert random keys" {
     const io = std.testing.io;
     const allocator = test_allocator;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
@@ -238,15 +248,30 @@ test "insert random keys" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     const random = prng.random();
 
+    var values: std.StringHashMap([]const u8) = .init(allocator);
+    defer values.deinit();
+
     std.debug.print("random1 == \n", .{});
     for (0..110) |_| {
         var key: [10]u8 = undefined;
         random.bytes(&key);
+        //fillAlphanumericAndUnderscore(random, &key);
         try tree.insert(&key, "one");
+        try values.put(try arena_allocator.dupe(u8, &key), try arena_allocator.dupe(u8, "one"));
+        try expectValidTree(&tree);
     }
     std.debug.print("== /random == \n", .{});
 
-    try expectValidTree(&tree);
+    // ensure keys were inserted in the tree
+    var it = values.iterator();
+    while (it.next()) |entry| {
+        const res = try tree.find(entry.key_ptr.*);
+        defer tree.page_cache.put(res.page);
+
+        var cell = res.cell orelse return error.KeyMissing;
+        try std.testing.expectEqualSlices(u8, entry.key_ptr.*, cell.key());
+        try std.testing.expectEqualSlices(u8, entry.value_ptr.*, cell.val());
+    }
 }
 
 //  fanout = 4
