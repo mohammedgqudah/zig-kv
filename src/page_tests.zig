@@ -45,9 +45,7 @@ pub fn expectValidTree(tree: *Tree) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    std.debug.print("== tree ==\n ", .{});
     _ = try expectValidTreeNode(allocator, tree, tree.root_page_id);
-    std.debug.print("== //tree == \n", .{});
 }
 
 pub fn expectValidTreeNode(
@@ -55,7 +53,6 @@ pub fn expectValidTreeNode(
     tree: *Tree,
     page_id: PageId,
 ) !validPageResult {
-    std.debug.print("NODE\n", .{});
     var page: *PageBuffer = (try tree.page_cache.get(page_id)).?;
     defer tree.page_cache.put(page);
 
@@ -251,7 +248,6 @@ test "insert random keys" {
     var values: std.StringHashMap([]const u8) = .init(allocator);
     defer values.deinit();
 
-    std.debug.print("random1 == \n", .{});
     for (0..200) |_| {
         var key: [10]u8 = undefined;
         random.bytes(&key);
@@ -260,7 +256,6 @@ test "insert random keys" {
         try values.put(try arena_allocator.dupe(u8, &key), try arena_allocator.dupe(u8, "one"));
         try expectValidTree(&tree);
     }
-    std.debug.print("== /random == \n", .{});
 
     // ensure keys were inserted in the tree
     var it = values.iterator();
