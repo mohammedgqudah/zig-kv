@@ -481,7 +481,7 @@ pub const Tree = struct {
             // TODO: same calculation is in split_page, keep in sync
             const split_index = page.pointers().len / 2;
             const new_page = try self.split_page(page);
-            
+
             // after splitting the page, the smallest key in the right half should be
             // promopted to the parent as a separator. The smallest is either the new key we're inserting, or
             // the first key in the half.
@@ -492,8 +492,6 @@ pub const Tree = struct {
             if (insert_idx >= split_index) {
                 target_page = new_page;
                 insert_idx -= split_index;
-            } else {
-                self.page_cache.put(new_page);
             }
             _ = path.pop(); // old leaf id
             const parent_id = parent_id: {
@@ -517,6 +515,11 @@ pub const Tree = struct {
                 separator_key,
                 &path,
             );
+            // release the new page buffer is the new key will be inserted
+            // in the left half (old page).
+            if (target_page.page_id != new_page.page_id) {
+                self.page_cache.put(new_page);
+            }
         }
 
         // shift pointers to right (starting from upper bound)
