@@ -427,7 +427,7 @@ pub const Tree = struct {
             new_page.header().number_of_cells += 1;
             new_page.header().lower += @sizeOf(CellOffset);
             new_page.header().upper -= old_cell.len();
-            new_page.pointers()[idx] = page.header().upper;
+            new_page.pointers()[idx] = new_page.header().upper;
 
             var new_cell = new_page.cell(new_page.header().upper);
             new_cell.from_keyval(old_cell.key(), old_cell.val());
@@ -470,6 +470,14 @@ pub const Tree = struct {
             // TODO: same calculation is in split_page, keep in sync
             const split_index = page.pointers().len / 2;
             const new_page = try self.split_page(page);
+            
+            // after splitting the page, the smallest key in the right half should be
+            // promopted to the parent as a separator. The smallest is either the new key we're inserting, or
+            // the first key in the half.
+            const separator_key = if (insert_idx == split_index) key else blk: {
+                var first_cell = new_page.cell(new_page.pointers()[0]);
+                break :blk first_cell.key();
+            };
             if (insert_idx >= split_index) {
                 target_page = new_page;
                 insert_idx -= split_index;
@@ -493,7 +501,7 @@ pub const Tree = struct {
                 parent_id,
                 page.page_id,
                 new_page.page_id,
-                key,
+                separator_key,
                 &path,
             );
         }
