@@ -343,6 +343,7 @@ pub const Tree = struct {
         const _value = old_page_id;
         const value: []const u8 = @ptrCast(&_value);
         const page = (try self.page_cache.get(parent_page_id)).?;
+        defer self.page_cache.put(page);
 
         std.debug.print("available space in parent: {d}\n", .{page.header().freeSpace()});
         // now, figure out where to insert
@@ -466,9 +467,9 @@ pub const Tree = struct {
         const expected_size = key.len + value.len + @sizeOf(u64) * 2;
         if (find_result.page.header().freeSpace() < expected_size + @sizeOf(CellOffset)) {
             var path = find_result.path orelse @panic("path is tracked");
-            const new_page = try self.split_page(page);
             // TODO: same calculation is in split_page, keep in sync
             const split_index = page.pointers().len / 2;
+            const new_page = try self.split_page(page);
             if (insert_idx >= split_index) {
                 target_page = new_page;
                 insert_idx -= split_index;
