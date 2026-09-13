@@ -4,6 +4,8 @@ const stdx = @import("stdx.zig");
 const devmapper = @import("devicemapper.zig");
 const page = @import("page.zig");
 const page_tests = @import("page_tests.zig");
+const PageCache = @import("PageCache.zig");
+const BTree = @import("BTree.zig");
 
 const Io = std.Io;
 const assert = std.debug.assert;
@@ -166,4 +168,6 @@ test {
     std.testing.refAllDecls(stdx);
     std.testing.refAllDecls(page);
     std.testing.refAllDecls(page_tests);
+    std.testing.refAllDecls(PageCache);
+    std.testing.refAllDecls(BTree);
 }

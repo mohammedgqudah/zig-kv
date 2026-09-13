@@ -3,13 +3,13 @@ const builtin = @import("builtin");
 const testing = std.testing;
 
 const pagemod = @import("page.zig");
-const PageCache = pagemod.PageCache;
+const PageCache = @import("PageCache.zig");
+const Tree = @import("BTree.zig");
 const PageId = pagemod.PageId;
 const CellOffset = pagemod.CellOffset;
 const PageHeader = pagemod.PageHeader;
 const PageBuffer = pagemod.PageBuffer;
 const Cell = pagemod.Cell;
-const Tree = pagemod.Tree;
 const page_size = pagemod.page_size;
 const page_magic = pagemod.page_magic;
 
