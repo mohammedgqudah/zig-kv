@@ -62,7 +62,7 @@ pub fn load(allocator: mem.Allocator, io: Io, file: Io.File) Self {
     };
 }
 
-pub fn _find(self: *Self, key: []const u8, options: FindOptions) !FindResult {
+fn _find(self: *Self, key: []const u8, options: FindOptions) !FindResult {
     var path: ?std.ArrayList(PageId) = if (options.track_path)
         .empty
     else
