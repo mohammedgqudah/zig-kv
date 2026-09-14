@@ -217,7 +217,8 @@ fn insert_separator(
     self.page_cache.mark_page_dirty(page);
 }
 
-/// Split `page` into two pages.
+/// Only split `page` into two pages, without promoting a key
+/// and updating pointers.
 /// The existing `page` is the left half, and the returned page
 /// is the right half.
 ///
@@ -230,7 +231,7 @@ fn insert_separator(
 ///
 /// left: [1, 3, 4]
 /// right: [5, 6, 7]
-pub fn split_page(self: *Self, page: *PageBuffer) !*PageBuffer {
+pub fn __split_page(self: *Self, page: *PageBuffer) !*PageBuffer {
     std.debug.print("splitting page {d}\n", .{page.page_id});
     const new_page_id = try self.page_cache.allocate();
     const new_page = try self.page_cache.get(new_page_id) orelse @panic("unreachable");
@@ -266,14 +267,81 @@ pub fn split_page(self: *Self, page: *PageBuffer) !*PageBuffer {
     return new_page;
 }
 
+const SplitPageResult = struct {
+    /// The page to insert the new key after splitting
+    target_page: *PageBuffer,
+    insert_idx: usize,
+};
+
+/// Split `page` into two pages.
+/// The existing `page` is the left half, and the returned page
+/// is the right half.
+pub fn split_page(
+    self: *Self,
+    find_result: FindResult,
+    key: []const u8,
+) !SplitPageResult {
+    var page: *PageBuffer = find_result.page;
+    var path = find_result.path orelse @panic("path is tracked");
+    var insert_idx = find_result.upper_bound_idx orelse page.pointers().len;
+    var target_page: *PageBuffer = page;
+
+    const split_index = page.pointers().len / 2;
+    const new_page = try self.__split_page(page);
+
+    // after splitting the page, the smallest key in the right half should be
+    // prompted to the parent as a separator. The smallest is either
+    // the new key we're inserting, or the first key in the half.
+    const separator_key = if (insert_idx == split_index) key else blk: {
+        var first_cell = new_page.cell(new_page.pointers()[0]);
+        break :blk first_cell.key();
+    };
+    if (insert_idx >= split_index) {
+        target_page = new_page;
+        insert_idx -= split_index;
+    }
+    _ = path.pop(); // old leaf id
+    const parent_id = parent_id: {
+        if (path.pop()) |id| break :parent_id id;
+        const new_root_id = try self.page_cache.allocate();
+        var new_root = (try self.page_cache.get(new_root_id)).?;
+        defer self.page_cache.put(new_root);
+        new_root.header().* = .empty(.internal);
+        self.root_page_id = new_root.page_id;
+        break :parent_id new_root_id;
+    };
+    try self.insert_separator(
+        parent_id,
+        page.page_id,
+        new_page.page_id,
+        separator_key,
+        &path,
+    );
+    // release the new_page buffer because "key" will be inserted
+    // in the left half (old page).
+    if (target_page.page_id != new_page.page_id) {
+        self.page_cache.put(new_page);
+    }
+
+    return .{
+        .target_page = target_page,
+        .insert_idx = insert_idx,
+    };
+}
+
 pub fn insert(
     self: *Self,
     key: []const u8,
     value: []const u8,
 ) !void {
     var find_result = try self._find(key, .{ .track_path = true });
+    if (find_result.cell != null)
+        return error.KeyAlreadyExists;
     var page: *PageBuffer = find_result.page;
+    // target page is usually the page we found, unless the page had to be split,
+    // in which case the target page might be the new (right half) page.
     var target_page: *PageBuffer = page;
+    var insert_idx = find_result.upper_bound_idx orelse page.pointers().len;
     defer {
         if (target_page.page_id != page.page_id) {
             self.page_cache.put(target_page);
@@ -282,58 +350,14 @@ pub fn insert(
         find_result.path.?.deinit(self.allocator);
     }
 
-    if (find_result.cell != null)
-        return error.KeyAlreadyExists;
-
-    // TODO: page and index to insert in, could change if we split
-    var insert_idx = find_result.upper_bound_idx orelse page.pointers().len;
-
-    // now, figure out where to insert
-    const expected_size = key.len + value.len + @sizeOf(u64) * 2;
-    if (find_result.page.header().freeSpace() < expected_size + @sizeOf(CellOffset)) {
-        var path = find_result.path orelse @panic("path is tracked");
-        // TODO: same calculation is in split_page, keep in sync
-        const split_index = page.pointers().len / 2;
-        const new_page = try self.split_page(page);
-
-        // after splitting the page, the smallest key in the right half should be
-        // promopted to the parent as a separator. The smallest is either the new key we're inserting, or
-        // the first key in the half.
-        const separator_key = if (insert_idx == split_index) key else blk: {
-            var first_cell = new_page.cell(new_page.pointers()[0]);
-            break :blk first_cell.key();
-        };
-        if (insert_idx >= split_index) {
-            target_page = new_page;
-            insert_idx -= split_index;
-        }
-        _ = path.pop(); // old leaf id
-        const parent_id = parent_id: {
-            if (path.pop()) |id| break :parent_id id;
-            const new_root_id = try self.page_cache.allocate();
-            var new_root = (try self.page_cache.get(new_root_id)).?;
-            defer self.page_cache.put(new_root); // <- why does leaking cause inconsisntecy
-            new_root.header().* = .empty(.internal);
-            std.debug.print("new root: {d}, space= {d}\n", .{
-                new_root.page_id,
-                new_root.header().freeSpace(),
-            });
-            self.root_page_id = new_root.page_id;
-            break :parent_id new_root_id;
-        };
-        std.debug.print("parent _id={d}\n", .{parent_id});
-        try self.insert_separator(
-            parent_id,
-            page.page_id,
-            new_page.page_id,
-            separator_key,
-            &path,
-        );
-        // release the new page buffer is the new key will be inserted
-        // in the left half (old page).
-        if (target_page.page_id != new_page.page_id) {
-            self.page_cache.put(new_page);
-        }
+    const cell_size = key.len + value.len + @sizeOf(u64) * 2;
+    const needed_size = cell_size + @sizeOf(CellOffset);
+    // split the page if it doesn't have enough free space. In the future,
+    // we should support overflow pages, and decide when to compact a page.
+    if (find_result.page.header().freeSpace() < needed_size) {
+        const split_result = try self.split_page(find_result, key);
+        target_page = split_result.target_page;
+        insert_idx = split_result.insert_idx;
     }
 
     // shift pointers to right (starting from upper bound)
@@ -344,7 +368,7 @@ pub fn insert(
     );
 
     target_page.header().number_of_cells += 1;
-    target_page.header().upper -= expected_size;
+    target_page.header().upper -= cell_size;
     target_page.header().lower += @sizeOf(CellOffset);
     target_page.pointers()[insert_idx] = target_page.header().upper;
     var cell: Cell = .raw(target_page.inner[target_page.header().upper..].ptr);
