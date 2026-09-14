@@ -11,6 +11,12 @@ const page_size = pagemod.page_size;
 const Io = std.Io;
 const mem = std.mem;
 
+/// Errors that can occur while mutating the tree.
+pub const Error = mem.Allocator.Error ||
+    Io.File.ReadPositionalError ||
+    Io.File.WritePositionalError ||
+    error{IncompletePage};
+
 /// A B+tree
 const Self = @This();
 
@@ -151,35 +157,27 @@ fn insert_separator(
     new_page_id: PageId,
     key: []const u8,
     path: *std.ArrayList(PageId),
-) !void {
-    _ = path;
-
-    const _value = old_page_id;
-    const value: []const u8 = @ptrCast(&_value);
+) Error!void {
     const page = (try self.page_cache.get(parent_page_id)).?;
-    defer self.page_cache.put(page);
-
-    std.debug.print("available space in parent: {d}\n", .{page.header().freeSpace()});
-    // now, figure out where to insert
-    const expected_size = key.len + value.len + @sizeOf(u64) * 2;
-    if (page.header().freeSpace() < expected_size + @sizeOf(CellOffset)) {
-        @panic("propagting split not supported");
+    var target_page = page;
+    defer {
+        if (target_page.page_id != page.page_id) {
+            self.page_cache.put(target_page);
+        }
+        self.page_cache.put(page);
     }
 
+    // calculate upper bound
     var upper_bound_idx: ?usize = null;
     var low: usize = 0;
     var high: usize = page.pointers().len;
     if (high == 0)
         upper_bound_idx = 0;
-
     while (low < high) {
         const mid = low + (high - low) / 2;
-        const midOffset: CellOffset = page.pointers()[mid];
-        var cell: Cell = page.cell(midOffset);
+        var cell = page.cell(page.pointers()[mid]);
         switch (mem.order(u8, key, cell.key())) {
-            .eq => {
-                @panic("unreachable - parent already has the key");
-            },
+            .eq => @panic("unreachable - the parent cannot already have the key"),
             .lt => {
                 high = mid;
                 upper_bound_idx = mid;
@@ -188,33 +186,53 @@ fn insert_separator(
         }
     }
 
-    const insert_idx = upper_bound_idx orelse page.pointers().len;
+    var insert_idx = upper_bound_idx orelse page.pointers().len;
     std.debug.print("separator insert index: {d} @ page {d} @ {*}\n", .{ insert_idx, parent_page_id, page });
-    // shift pointers to right to inesrt new separator
-    const old_len = page.header().number_of_cells;
+
+    const _value = old_page_id;
+    const value: []const u8 = @ptrCast(&_value);
+
+    const cell_size = key.len + value.len + @sizeOf(u64) * 2;
+    const needed_size = cell_size + @sizeOf(CellOffset);
+    if (page.header().freeSpace() < needed_size) {
+        const split_result = try self.split_page(
+            .{
+                .page = page,
+                .cell = null,
+                .upper_bound_idx = upper_bound_idx,
+                .path = path.*,
+            },
+            key,
+        );
+        target_page = split_result.target_page;
+        insert_idx = split_result.insert_idx;
+        path.* = split_result.path;
+    }
+
+    // shift pointers to right to insert new separator
+    const old_len = target_page.header().number_of_cells;
     if (insert_idx < old_len) {
         @memmove(
-            page.pointers().ptr[insert_idx + 1 .. old_len + 1],
-            page.pointers()[insert_idx..old_len],
+            target_page.pointers().ptr[insert_idx + 1 .. old_len + 1],
+            target_page.pointers()[insert_idx..old_len],
         );
     }
-    page.header().number_of_cells += 1;
-    page.header().upper -= expected_size;
-    page.header().lower += @sizeOf(CellOffset);
-    page.pointers()[insert_idx] = page.header().upper;
-    //var cell: Cell = .raw(page.inner[page.header().upper..].ptr);
-    var cell = page.cell(page.offset(insert_idx));
+    target_page.header().number_of_cells += 1;
+    target_page.header().upper -= cell_size;
+    target_page.header().lower += @sizeOf(CellOffset);
+    target_page.pointers()[insert_idx] = target_page.header().upper;
+    var cell = target_page.cell(target_page.offset(insert_idx));
     cell.from_keyval(key, value);
-    if (insert_idx + 1 == page.pointers().len) {
+    if (insert_idx + 1 == target_page.pointers().len) {
         std.debug.print("assigning right pointer\n", .{});
-        page.header().right_pointer = new_page_id;
+        target_page.header().right_pointer = new_page_id;
     } else {
         std.debug.print("updating pointer to the right\n", .{});
         const p: []const u8 = @ptrCast(&new_page_id);
-        var after_cell = page.cell(page.offset(insert_idx + 1));
+        var after_cell = target_page.cell(target_page.offset(insert_idx + 1));
         @memcpy(after_cell.val(), p);
     }
-    self.page_cache.mark_page_dirty(page);
+    self.page_cache.mark_page_dirty(target_page);
 }
 
 /// Only split `page` into two pages, without promoting a key
@@ -271,11 +289,17 @@ const SplitPageResult = struct {
     /// The page to insert the new key after splitting
     target_page: *PageBuffer,
     insert_idx: usize,
+    // hack alert, return the same path that was passed,
+    // because i had to shallow copy it in insert_separator
+    path: std.ArrayList(PageId),
 };
 
 /// Split `page` into two pages.
 /// The existing `page` is the left half, and the returned page
 /// is the right half.
+/// 
+/// `key` is what caused the split to occur, it's only needed in case `key` becomes the smallest key
+/// in the new right have, and has to be promoted to the parent.
 pub fn split_page(
     self: *Self,
     find_result: FindResult,
@@ -326,6 +350,7 @@ pub fn split_page(
     return .{
         .target_page = target_page,
         .insert_idx = insert_idx,
+        .path = path,
     };
 }
 

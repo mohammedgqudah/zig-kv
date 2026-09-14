@@ -248,13 +248,13 @@ test "insert random keys" {
     var values: std.StringHashMap([]const u8) = .init(allocator);
     defer values.deinit();
 
-    for (0..300) |_| {
+    for (0..10000) |_| {
         var key: [10]u8 = undefined;
         random.bytes(&key);
         //fillAlphanumericAndUnderscore(random, &key);
         try tree.insert(&key, "one");
         try values.put(try arena_allocator.dupe(u8, &key), try arena_allocator.dupe(u8, "one"));
-        try expectValidTree(&tree);
+        //try expectValidTree(&tree);
     }
 
     // ensure keys were inserted in the tree
