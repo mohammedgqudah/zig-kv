@@ -248,12 +248,55 @@ test "insert random keys" {
     var values: std.StringHashMap([]const u8) = .init(allocator);
     defer values.deinit();
 
-    for (0..10000) |_| {
+    for (0..800) |_| {
         var key: [10]u8 = undefined;
         random.bytes(&key);
         //fillAlphanumericAndUnderscore(random, &key);
         try tree.insert(&key, "one");
         try values.put(try arena_allocator.dupe(u8, &key), try arena_allocator.dupe(u8, "one"));
+        try expectValidTree(&tree);
+    }
+
+    // ensure keys were inserted in the tree
+    var it = values.iterator();
+    while (it.next()) |entry| {
+        const res = try tree.find(entry.key_ptr.*);
+        defer tree.page_cache.put(res.page);
+
+        var cell = res.cell orelse return error.KeyMissing;
+        try std.testing.expectEqualSlices(u8, entry.key_ptr.*, cell.key());
+        try std.testing.expectEqualSlices(u8, entry.value_ptr.*, cell.val());
+    }
+}
+
+test "test propgating splits" {
+    const io = std.testing.io;
+    const allocator = test_allocator;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
+
+    var tree: Tree = try .empty(allocator, io, file);
+    defer tree.deinit();
+
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const random = prng.random();
+
+    var values: std.StringHashMap([]const u8) = .init(allocator);
+    defer values.deinit();
+
+    for (0..7000) |_| {
+        var key: [10]u8 = undefined;
+        var val: [10]u8 = undefined;
+        random.bytes(&key);
+        random.bytes(&val);
+        try tree.insert(&key, &val);
+        try values.put(try arena_allocator.dupe(u8, &key), try arena_allocator.dupe(u8, &val));
         //try expectValidTree(&tree);
     }
 
