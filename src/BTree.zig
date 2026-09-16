@@ -183,20 +183,8 @@ fn insert_separator(
         insert_idx = split_result.insert_idx;
     }
 
-    // shift pointers to right to insert new separator
-    const old_len = target_page.header().number_of_cells;
-    if (insert_idx < old_len) {
-        @memmove(
-            target_page.pointers().ptr[insert_idx + 1 .. old_len + 1],
-            target_page.pointers()[insert_idx..old_len],
-        );
-    }
-    target_page.header().number_of_cells += 1;
-    target_page.header().upper -= cell_size;
-    target_page.header().lower += @sizeOf(CellOffset);
-    target_page.pointers()[insert_idx] = target_page.header().upper;
-    var cell = target_page.cell(target_page.offset(insert_idx));
-    cell.from_keyval(key, value);
+    writeCell(target_page, insert_idx, key, value);
+
     if (insert_idx + 1 == target_page.pointers().len) {
         std.debug.print("assigning right pointer\n", .{});
         target_page.header().right_pointer = new_page_id;
@@ -364,53 +352,57 @@ pub fn split_page(
     };
 }
 
+inline fn cellSize(key: []const u8, value: []const u8) usize {
+    return key.len + value.len + @sizeOf(u64) * 2;
+}
+
+/// Shift pointers to the right, and then write a cell at `idx`.
+fn writeCell(page: *PageBuffer, idx: usize, key: []const u8, value: []const u8) void {
+    const pointers = page.pointers();
+    if (idx < pointers.len)
+        @memmove(pointers.ptr[idx + 1 .. pointers.len + 1], pointers[idx..]);
+
+    page.header().number_of_cells += 1;
+    page.header().lower += @sizeOf(CellOffset);
+    page.header().upper -= cellSize(key, value);
+    page.pointers()[idx] = page.header().upper;
+
+    var cell = page.cell(page.header().upper);
+    cell.from_keyval(key, value);
+}
+
+/// Check if the page has room to insert a cell and its pointer (offset)
+fn hasRoom(page: *PageBuffer, key: []const u8, value: []const u8) bool {
+    const needed_size = cellSize(key, value) + @sizeOf(CellOffset);
+    return page.header().freeSpace() >= needed_size;
+}
+
 pub fn insert(
     self: *Self,
     key: []const u8,
     value: []const u8,
 ) !void {
     var path: Path = .empty;
-    var page = try self.descend(key, &path);
-    var insert_idx = upperBound(page, key);
-    const maybe_existing = lookupCell(page, key, insert_idx);
-    if (maybe_existing != null)
-        return error.KeyAlreadyExists;
-
-    // target page is usually the page we found, unless the page had to be split,
-    // in which case the target page might be the new (right half) page.
-    var target_page: *PageBuffer = page;
+    const page = try self.descend(key, &path);
+    var target = page;
     defer {
-        if (target_page.page_id != page.page_id) {
-            self.page_cache.put(target_page);
-        }
+        if (target.page_id != page.page_id) self.page_cache.put(target);
         self.page_cache.put(page);
         path.deinit(self.allocator);
     }
 
-    const cell_size = key.len + value.len + @sizeOf(u64) * 2;
-    const needed_size = cell_size + @sizeOf(CellOffset);
-    // split the page if it doesn't have enough free space. In the future,
-    // we should support overflow pages, and decide when to compact a page.
-    if (page.header().freeSpace() < needed_size) {
-        const split_result = try self.split_page(page, &path, insert_idx, key);
-        target_page = split_result.target_page;
-        insert_idx = split_result.insert_idx;
+    const insert_idx = upperBound(page, key);
+    if (lookupCell(page, key, insert_idx) != null) return error.KeyAlreadyExists;
+
+    if (hasRoom(page, key, value)) {
+        writeCell(target, insert_idx, key, value);
+    } else {
+        const result = try self.split_page(page, &path, insert_idx, key);
+        target = result.target_page;
+        writeCell(target, result.insert_idx, key, value);
     }
 
-    // shift pointers to right (starting from upper bound)
-    const pointers = target_page.pointers();
-    @memmove(
-        pointers.ptr[insert_idx + 1 .. pointers.len + 1],
-        pointers[insert_idx..],
-    );
-
-    target_page.header().number_of_cells += 1;
-    target_page.header().upper -= cell_size;
-    target_page.header().lower += @sizeOf(CellOffset);
-    target_page.pointers()[insert_idx] = target_page.header().upper;
-    var cell: Cell = .raw(target_page.inner[target_page.header().upper..].ptr);
-    cell.from_keyval(key, value);
-    self.page_cache.mark_page_dirty(target_page);
+    self.page_cache.mark_page_dirty(target);
 }
 
 pub fn deinit(self: *Self) void {
