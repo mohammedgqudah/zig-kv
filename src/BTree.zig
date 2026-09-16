@@ -26,16 +26,6 @@ pub const FindResult = struct {
     /// The lifetime of the cell is tied to the page buffer
     cell: ?Cell,
     page: *PageBuffer,
-    /// Index of the pointer that points to key upper bound in page.
-    /// If null, then the key is the greatest in the page.
-    upper_bound_idx: ?usize,
-    /// If "track_path" was set. The caller owns this allocation
-    path: ?std.ArrayList(PageId) = null,
-};
-
-pub const FindOptions = struct {
-    /// Track pages while traversing the tree
-    track_path: bool,
 };
 
 io: Io,
@@ -123,8 +113,6 @@ pub fn find(self: *Self, key: []const u8) !FindResult {
     return .{
         .cell = cell,
         .page = leaf,
-        .path = null,
-        .upper_bound_idx = upper_bound,
     };
 }
 
