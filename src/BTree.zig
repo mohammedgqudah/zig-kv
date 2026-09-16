@@ -68,86 +68,64 @@ pub fn load(allocator: mem.Allocator, io: Io, file: Io.File) Self {
     };
 }
 
-fn _find(self: *Self, key: []const u8, options: FindOptions) !FindResult {
-    var path: ?std.ArrayList(PageId) = if (options.track_path)
-        .empty
-    else
-        null;
-
-    var page_id: u64 = self.root_page_id;
-
-    while (true) {
-        if (options.track_path)
-            try path.?.append(self.allocator, page_id);
-
-        var next_page_id: ?PageId = null;
-        const page = (try self.page_cache.get(page_id)).?;
-        const header = page.header();
-        var upper_bound_idx: ?usize = null;
-        var low: usize = 0;
-        var high: usize = page.pointers().len;
-
-        if (high == 0)
-            return .{ .cell = null, .page = page, .upper_bound_idx = null, .path = path };
-
-        while (low < high) {
-            const mid = low + (high - low) / 2;
-            const midOffset: CellOffset = page.pointers()[mid];
-            var cell: Cell = page.cell(midOffset);
-            switch (mem.order(u8, key, cell.key())) {
-                .eq => {
-                    switch (header.type) {
-                        .internal => {
-                            if (mid + 1 >= page.pointers().len) {
-                                next_page_id = page.header().right_pointer;
-                            } else {
-                                const offset = page.pointers()[mid + 1];
-                                cell = page.cell(offset);
-                                next_page_id = mem.readInt(u64, @ptrCast(cell.val()), .little);
-                            }
-                            break;
-                        },
-                        .leaf => {
-                            return .{ .cell = cell, .page = page, .upper_bound_idx = upper_bound_idx, .path = path };
-                        },
-                    }
-                },
-                .lt => {
-                    high = mid;
-                    upper_bound_idx = mid;
-                },
-                .gt => low = mid + 1,
-            }
-        }
-
-        // we reached the bottom of the tree and there are no more pointers to follow
-        if (page.header().type == .leaf) {
-            return .{
-                .cell = null,
-                .page = page,
-                .upper_bound_idx = upper_bound_idx,
-                .path = path,
-            };
-        }
-
-        if (next_page_id) |id| {
-            page_id = id;
-        } else if (upper_bound_idx) |idx| {
-            const offset = page.pointers()[idx];
-            var cell = page.cell(offset);
-            page_id = mem.readInt(u64, @ptrCast(cell.val()), .little);
+/// Index of the first pointer whose key is greater than `key`.
+///
+/// If `key` is greater than all keys, then pointers.len is returned.
+fn upperBound(page: *PageBuffer, key: []const u8) usize {
+    var low: usize = 0;
+    var high: usize = page.pointers().len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        var cell = page.cell(page.pointers()[mid]);
+        if (mem.order(u8, key, cell.key()) == .lt) {
+            high = mid;
         } else {
-            page_id = page.header().right_pointer;
+            low = mid + 1;
         }
+    }
+    return low;
+}
+
+const Path = std.ArrayList(PageId);
+
+/// Return the child (page_id) a cell is pointing to.
+fn childAt(page: *PageBuffer, index: usize) PageId {
+    std.debug.assert(page.header().type == .internal);
+    if (index == page.pointers().len) return page.header().right_pointer;
+    var cell = page.cell(page.pointers()[index]);
+    return mem.readInt(PageId, @ptrCast(cell.val()), .little);
+}
+
+/// Descend the tree until a leaf that might hold `key` is found.
+fn descend(self: *Self, key: []const u8, path: ?*Path) Error!*PageBuffer {
+    var page_id = self.root_page_id;
+    while (true) {
+        const page = (try self.page_cache.get(page_id)).?;
+
+        if (path) |p| try p.append(self.allocator, page_id);
+        if (page.header().type == .leaf) return page;
+        page_id = childAt(page, upperBound(page, key));
         self.page_cache.put(page);
     }
-    @panic("unreachable");
+}
+
+fn lookupCell(leaf: *PageBuffer, key: []const u8, upper_bound_idx: usize) ?Cell {
+    if (upper_bound_idx == 0) return null;
+    var cell = leaf.cell(leaf.pointers()[upper_bound_idx - 1]);
+    return if (mem.eql(u8, key, cell.key())) cell else null;
 }
 
 pub fn find(self: *Self, key: []const u8) !FindResult {
-    return self._find(key, .{
-        .track_path = false,
-    });
+    const leaf = try self.descend(key, null);
+    const upper_bound = upperBound(leaf, key);
+    const cell = lookupCell(leaf, key, upper_bound);
+
+    return .{
+        .cell = cell,
+        .page = leaf,
+        .path = null,
+        .upper_bound_idx = upper_bound,
+    };
 }
 
 fn insert_separator(
@@ -196,17 +174,13 @@ fn insert_separator(
     const needed_size = cell_size + @sizeOf(CellOffset);
     if (page.header().freeSpace() < needed_size) {
         const split_result = try self.split_page(
-            .{
-                .page = page,
-                .cell = null,
-                .upper_bound_idx = upper_bound_idx,
-                .path = path.*,
-            },
+            page,
+            path,
+            upper_bound_idx orelse page.pointers().len,
             key,
         );
         target_page = split_result.target_page;
         insert_idx = split_result.insert_idx;
-        path.* = split_result.path;
     }
 
     // shift pointers to right to insert new separator
@@ -305,9 +279,6 @@ const SplitPageResult = struct {
     /// The page to insert the new key after splitting
     target_page: *PageBuffer,
     insert_idx: usize,
-    // hack alert, return the same path that was passed,
-    // because i had to shallow copy it in insert_separator
-    path: std.ArrayList(PageId),
 };
 
 /// Split `page` into two pages.
@@ -319,12 +290,12 @@ const SplitPageResult = struct {
 ///
 pub fn split_page(
     self: *Self,
-    find_result: FindResult,
+    page: *PageBuffer,
+    path: *Path,
+    upper_bound: usize,
     key: []const u8,
 ) !SplitPageResult {
-    var page: *PageBuffer = find_result.page;
-    var path = find_result.path orelse @panic("path is tracked");
-    var insert_idx = find_result.upper_bound_idx orelse page.pointers().len;
+    var insert_idx = upper_bound;
     var target_page: *PageBuffer = page;
 
     var separator_key_buf: [page_size]u8 = undefined;
@@ -379,7 +350,7 @@ pub fn split_page(
         page.page_id,
         new_page.page_id,
         separator_key,
-        &path,
+        path,
     );
     // release the new_page buffer because "key" will be inserted
     // in the left half (old page).
@@ -390,7 +361,6 @@ pub fn split_page(
     return .{
         .target_page = target_page,
         .insert_idx = insert_idx,
-        .path = path,
     };
 }
 
@@ -399,28 +369,30 @@ pub fn insert(
     key: []const u8,
     value: []const u8,
 ) !void {
-    var find_result = try self._find(key, .{ .track_path = true });
-    if (find_result.cell != null)
+    var path: Path = .empty;
+    var page = try self.descend(key, &path);
+    var insert_idx = upperBound(page, key);
+    const maybe_existing = lookupCell(page, key, insert_idx);
+    if (maybe_existing != null)
         return error.KeyAlreadyExists;
-    var page: *PageBuffer = find_result.page;
+
     // target page is usually the page we found, unless the page had to be split,
     // in which case the target page might be the new (right half) page.
     var target_page: *PageBuffer = page;
-    var insert_idx = find_result.upper_bound_idx orelse page.pointers().len;
     defer {
         if (target_page.page_id != page.page_id) {
             self.page_cache.put(target_page);
         }
         self.page_cache.put(page);
-        find_result.path.?.deinit(self.allocator);
+        path.deinit(self.allocator);
     }
 
     const cell_size = key.len + value.len + @sizeOf(u64) * 2;
     const needed_size = cell_size + @sizeOf(CellOffset);
     // split the page if it doesn't have enough free space. In the future,
     // we should support overflow pages, and decide when to compact a page.
-    if (find_result.page.header().freeSpace() < needed_size) {
-        const split_result = try self.split_page(find_result, key);
+    if (page.header().freeSpace() < needed_size) {
+        const split_result = try self.split_page(page, &path, insert_idx, key);
         target_page = split_result.target_page;
         insert_idx = split_result.insert_idx;
     }
