@@ -3,13 +3,13 @@ const builtin = @import("builtin");
 const testing = std.testing;
 
 const pagemod = @import("page.zig");
-const PageCache = pagemod.PageCache;
+const PageCache = @import("PageCache.zig");
+const Tree = @import("BTree.zig");
 const PageId = pagemod.PageId;
 const CellOffset = pagemod.CellOffset;
 const PageHeader = pagemod.PageHeader;
 const PageBuffer = pagemod.PageBuffer;
 const Cell = pagemod.Cell;
-const Tree = pagemod.Tree;
 const page_size = pagemod.page_size;
 const page_magic = pagemod.page_magic;
 
@@ -73,8 +73,8 @@ pub fn expectValidTreeNode(
                     .{
                         page_id,
                         idx,
-                        prev_cell.key(),
-                        current_cell.key(),
+                        prev_cell.key()[0..10],
+                        current_cell.key()[0..10],
                     },
                 );
                 return error.InvalidPointers;
@@ -222,9 +222,19 @@ test {
     try expectValidTree(&tree);
 }
 
+pub fn fillAlphanumericAndUnderscore(random: std.Random, slice: []u8) void {
+    const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+    for (slice) |*b| b.* = charset[random.uintLessThan(usize, charset.len)];
+}
+
 test "insert random keys" {
     const io = std.testing.io;
     const allocator = test_allocator;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
@@ -235,13 +245,71 @@ test "insert random keys" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     const random = prng.random();
 
-    for (0..100) |_| {
+    var values: std.StringHashMap([]const u8) = .init(allocator);
+    defer values.deinit();
+
+    for (0..800) |_| {
         var key: [10]u8 = undefined;
         random.bytes(&key);
+        //fillAlphanumericAndUnderscore(random, &key);
         try tree.insert(&key, "one");
+        try values.put(try arena_allocator.dupe(u8, &key), try arena_allocator.dupe(u8, "one"));
+        try expectValidTree(&tree);
     }
 
-    try expectValidTree(&tree);
+    // ensure keys were inserted in the tree
+    var it = values.iterator();
+    while (it.next()) |entry| {
+        const res = try tree.find(entry.key_ptr.*);
+        defer tree.page_cache.put(res.page);
+
+        var cell = res.cell orelse return error.KeyMissing;
+        try std.testing.expectEqualSlices(u8, entry.key_ptr.*, cell.key());
+        try std.testing.expectEqualSlices(u8, entry.value_ptr.*, cell.val());
+    }
+}
+
+test "test propgating splits" {
+    const io = std.testing.io;
+    const allocator = test_allocator;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
+
+    var tree: Tree = try .empty(allocator, io, file);
+    defer tree.deinit();
+
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const random = prng.random();
+
+    var values: std.StringHashMap([]const u8) = .init(allocator);
+    defer values.deinit();
+
+    for (0..7000) |_| {
+        var key: [10]u8 = undefined;
+        var val: [10]u8 = undefined;
+        random.bytes(&key);
+        random.bytes(&val);
+        try tree.insert(&key, &val);
+        try values.put(try arena_allocator.dupe(u8, &key), try arena_allocator.dupe(u8, &val));
+        //try expectValidTree(&tree);
+    }
+
+    // ensure keys were inserted in the tree
+    var it = values.iterator();
+    while (it.next()) |entry| {
+        const res = try tree.find(entry.key_ptr.*);
+        defer tree.page_cache.put(res.page);
+
+        var cell = res.cell orelse return error.KeyMissing;
+        try std.testing.expectEqualSlices(u8, entry.key_ptr.*, cell.key());
+        try std.testing.expectEqualSlices(u8, entry.value_ptr.*, cell.val());
+    }
 }
 
 //  fanout = 4
@@ -427,4 +495,50 @@ test "some tree" {
     tree.page_cache.put(result.page);
     // fails because 10 is less than 9 lexically, i should use alphabet or stop at 9
     //try std.testing.expectEqualStrings("nine", (try tree.find("9", &storage)).?);
+}
+
+// use large keys and values to acheive low fanout and split early.
+test "insert keys in ascending order" {
+    const io = std.testing.io;
+    const allocator = test_allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
+
+    var tree: Tree = try .empty(allocator, io, file);
+    defer tree.deinit();
+
+    var key: [1000]u8 = @splat(0);
+    var value: [700]u8 = @splat('v');
+
+    for (0..10) |i| {
+        _ = try fmt.bufPrint(key[0..20], "{d:0>20}", .{i});
+        try tree.insert(&key, &value);
+    }
+    try expectValidTree(&tree);
+}
+
+// use large keys and values to acheive low fanout and split early.
+test "insert keys in descending order" {
+    const io = std.testing.io;
+    const allocator = test_allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
+
+    var tree: Tree = try .empty(allocator, io, file);
+    defer tree.deinit();
+
+    var key: [1000]u8 = @splat(0);
+    var value: [700]u8 = @splat('v');
+
+    var i: usize = 10;
+    while (i > 0) {
+        i -= 1;
+        _ = try fmt.bufPrint(key[0..20], "{d:0>20}", .{i});
+        try tree.insert(&key, &value);
+    }
+    try expectValidTree(&tree);
 }

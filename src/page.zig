@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
 const config = @import("config");
+const PageCache = @import("PageCache.zig");
 
 const Io = std.Io;
 const mem = std.mem;
@@ -95,7 +96,6 @@ pub const Cell = struct {
 
     /// The *entire* cell length.
     pub fn len(self: *Self) usize {
-        std.debug.print("key size = {d}\n", .{self.key_size()});
         return self.key_size() + self.val_size() + @sizeOf(u64) * 2;
     }
 
@@ -142,7 +142,7 @@ pub const PageBuffer = struct {
         };
     }
 
-    pub fn header(self: *Self) *PageHeader {
+    pub inline fn header(self: *Self) *PageHeader {
         return @ptrCast(@alignCast(self.inner.ptr));
     }
 
@@ -181,262 +181,21 @@ pub const PageBuffer = struct {
         self.pointers()[ptr_idx] = head.upper;
         @memcpy(self.inner[head.upper .. head.upper + record.len], record);
     }
-};
 
-/// The result returned by a btree lookup.
-/// Lookup will stop when a leaf node is found and optionally the key is found.
-pub const FindResult = struct {
-    /// The lifetime of the cell is tied to the page buffer
-    cell: ?Cell,
-    page: *PageBuffer,
-    /// Index of the pointer that points to key upper bound in page.
-    /// If null, then the key is the greatest in the page.
-    upper_bound_idx: ?usize,
-};
-
-pub const Tree = struct {
-    const Self = @This();
-    io: Io,
-    file: Io.File,
-    root_page_id: u64 = 0,
-    page_cache: PageCache,
-
-    /// initialize a new tree, `file` is expected to be empty.
-    pub fn empty(allocator: mem.Allocator, io: Io, file: Io.File) !Self {
-        var tree: Self = .load(allocator, io, file);
-        const root_id = try tree.page_cache.allocate();
-        tree.root_page_id = root_id;
-
-        var root_page = (try tree.page_cache.get(root_id)).?;
-        defer tree.page_cache.put(root_page);
-
-        root_page.header().* = .empty(.leaf);
-        tree.page_cache.mark_page_dirty(root_page);
-
-        return tree;
-    }
-
-    pub fn load(allocator: mem.Allocator, io: Io, file: Io.File) Self {
-        return .{
-            .io = io,
-            .file = file,
-            .page_cache = .new(allocator, file, io),
-        };
-    }
-
-    pub fn find(self: *Self, key: []const u8) !FindResult {
-        var page_id: u64 = self.root_page_id;
-
-        while (true) {
-            var next_page_id: ?PageId = null;
-            const page = (try self.page_cache.get(page_id)).?;
-            const header = page.header();
-            var upper_bound_idx: ?usize = null;
-            var low: usize = 0;
-            var high: usize = page.pointers().len;
-
-            if (high == 0)
-                return .{ .cell = null, .page = page, .upper_bound_idx = null };
-
-            while (low < high) {
-                const mid = low + (high - low) / 2;
-                const midOffset: CellOffset = page.pointers()[mid];
-                var cell: Cell = page.cell(midOffset);
-                switch (mem.order(u8, key, cell.key())) {
-                    .eq => {
-                        switch (header.type) {
-                            .internal => {
-                                if (mid + 1 >= page.pointers().len) {
-                                    next_page_id = page.header().right_pointer;
-                                } else {
-                                    const offset = page.pointers()[mid + 1];
-                                    cell = page.cell(offset);
-                                    next_page_id = mem.readInt(u64, @ptrCast(cell.val()), .little);
-                                }
-                                break;
-                            },
-                            .leaf => {
-                                return .{ .cell = cell, .page = page, .upper_bound_idx = upper_bound_idx };
-                            },
-                        }
-                    },
-                    .lt => {
-                        high = mid;
-                        upper_bound_idx = mid;
-                    },
-                    .gt => low = mid + 1,
-                }
-            }
-
-            // we reached the bottom of the tree and there are no more pointers to follow
-            if (page.header().type == .leaf) {
-                return .{
-                    .cell = null,
-                    .page = page,
-                    .upper_bound_idx = upper_bound_idx,
-                };
-            }
-
-            if (next_page_id) |id| {
-                page_id = id;
-            } else if (upper_bound_idx) |idx| {
-                const offset = page.pointers()[idx];
-                var cell = page.cell(offset);
-                page_id = mem.readInt(u64, @ptrCast(cell.val()), .little);
-            } else {
-                page_id = page.header().right_pointer;
-            }
-            self.page_cache.put(page);
-        }
-        @panic("unreachable");
-    }
-
-    pub fn insert(
+    pub fn format(
         self: *Self,
-        key: []const u8,
-        value: []const u8,
-    ) !void {
-        var find_result = try self.find(key);
-        var page: *PageBuffer = find_result.page;
-        defer self.page_cache.put(page);
-
-        if (find_result.cell != null)
-            return error.KeyAlreadyExists;
-
-        // now, figure out where to insert
-        const expected_size = key.len + value.len + @sizeOf(u64) * 2;
-        if (find_result.page.header().freeSpace() < expected_size + @sizeOf(CellOffset)) {
-            @panic("split unimplemented");
-        }
-        const insert_idx = find_result.upper_bound_idx orelse page.pointers().len;
-        if (find_result.upper_bound_idx) |idx| {
-            // shift pointers to right (starting from upper bound)
-            @memmove(page.pointers().ptr[0 .. page.pointers().len + 1][idx + 1 ..], page.pointers()[idx..]);
-        }
-        page.header().number_of_cells += 1;
-        page.header().upper -= expected_size;
-        page.header().lower += @sizeOf(CellOffset);
-        page.pointers()[insert_idx] = page.header().upper;
-        var cell: Cell = .raw(page.inner[page.header().upper..].ptr);
-        cell.from_keyval(key, value);
-        self.page_cache.mark_page_dirty(page);
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.page_cache.deinit();
-    }
-};
-
-/// A hashmap based page cache.
-///
-/// Just like the rest of the code, this is not thread-safe, yet.
-pub const PageCache = struct {
-    pub const Self = @This();
-    cache: std.AutoHashMap(PageId, *PageBuffer),
-    // TODO: use a different allocator for the hashmap and the page buffer?
-    allocator: mem.Allocator,
-    file: Io.File,
-    io: Io,
-    // TODO: this is temporary. we should track free blocks some other way.
-    free_page_id: PageId = 0,
-
-    pub fn new(allocator: mem.Allocator, file: Io.File, io: Io) Self {
-        return .{
-            .allocator = allocator,
-            .cache = .init(allocator),
-            .file = file,
-            .io = io,
-        };
-    }
-
-    fn load_page(self: *Self, id: PageId) !*PageBuffer {
-        // TODO: should page buf be a fixed array inside PageBuffer?
-        //       it would allow us to do a single allocation.
-        const page_buf = try self.allocator.alignedAlloc(
-            u8,
-            .of(PageHeader),
-            page_size,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try writer.print(
+            "PageBuffer{{ page={}, ref_count={}, dirty={} }} @ {*}\n",
+            .{
+                self.page_id,
+                self.refcnt.load(.monotonic),
+                self.is_dirty,
+                self,
+            },
         );
-        const page = try self.allocator.create(PageBuffer);
-        errdefer {
-            self.allocator.free(page_buf);
-            self.allocator.destroy(page);
-        }
-
-        const read_len = try self.file.readPositionalAll(self.io, page_buf, id * page_size);
-        if (read_len != page_buf.len) {
-            return error.IncompletePage;
-        }
-
-        page.* = .new(page_buf, id);
-        return page;
-    }
-
-    pub fn mark_page_dirty(self: *Self, page: *PageBuffer) void {
-        _ = self;
-        page.is_dirty = true;
-    }
-
-    inline fn writeback_page(self: *Self, page: *PageBuffer) void {
-        self.file.writePositionalAll(self.io, page.inner, page.page_id * page_size) catch {
-            @panic("writeback failed");
-        };
-        page.is_dirty = false;
-    }
-
-    /// TODO: i'm not sure if this is the right API and if it belongs in PageCache
-    /// TODO: why even accept a page id? shouldn't we track the next free page id and return it?
-    pub fn allocate(self: *Self) !PageId {
-        const id = self.free_page_id;
-        self.free_page_id += 1;
-        errdefer self.free_page_id -= 1;
-
-        const page_buf: [page_size]u8 = undefined;
-        _ = try self.file.writePositionalAll(self.io, &page_buf, id * page_size);
-        // TOOD: should allocating also cache the page?
-        return id;
-    }
-
-    /// Get a page buffer.
-    ///
-    /// # Example
-    ///
-    /// ```zig
-    /// const result = try page_cache.get(page_id);
-    /// const page = result orelse return null;
-    /// defer page_cache.put(page);
-    /// // modify the page
-    /// ```
-    pub fn get(self: *Self, id: PageId) !?*PageBuffer {
-        if (config.disable_page_cache) {
-            return self.load_page(id);
-        }
-        const result = try self.cache.getOrPut(id);
-
-        if (!result.found_existing) {
-            errdefer _ = self.cache.remove(id);
-            result.value_ptr.* = try self.load_page(id);
-        }
-        _ = result.value_ptr.*.refcnt.fetchAdd(1, .monotonic);
-
-        return result.value_ptr.*;
-    }
-
-    pub fn put(self: *Self, page: *PageBuffer) void {
-        const old_refcnt = page.refcnt.fetchSub(1, .monotonic);
-        if (old_refcnt == 1) {
-            self.writeback_page(page);
-            self.allocator.free(page.inner);
-            self.allocator.destroy(page);
-        }
-    }
-
-    /// Drop page cace references to page buffers and deinit the hashmap.
-    pub fn deinit(self: *Self) void {
-        var it = self.cache.iterator();
-        while (it.next()) |entry| {
-            self.put(entry.value_ptr.*);
-        }
-        self.cache.deinit();
+        try writer.print("   inner @ {*}\n", .{self.inner.ptr});
     }
 };
+
