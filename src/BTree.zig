@@ -136,65 +136,34 @@ fn insert_separator(
     key: []const u8,
     path: *std.ArrayList(PageId),
 ) Error!void {
+    const _value = old_page_id;
+    const value: []const u8 = @ptrCast(&_value);
     const page = (try self.page_cache.get(parent_page_id)).?;
-    var target_page = page;
+    var target = page;
     defer {
-        if (target_page.page_id != page.page_id) {
-            self.page_cache.put(target_page);
-        }
+        if (target.page_id != page.page_id)
+            self.page_cache.put(target);
         self.page_cache.put(page);
     }
 
-    // calculate upper bound
-    var upper_bound_idx: ?usize = null;
-    var low: usize = 0;
-    var high: usize = page.pointers().len;
-    if (high == 0)
-        upper_bound_idx = 0;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        var cell = page.cell(page.pointers()[mid]);
-        switch (mem.order(u8, key, cell.key())) {
-            .eq => @panic("unreachable - the parent cannot already have the key"),
-            .lt => {
-                high = mid;
-                upper_bound_idx = mid;
-            },
-            .gt => low = mid + 1,
-        }
-    }
+    var insert_idx = upperBound(page, key);
 
-    var insert_idx = upper_bound_idx orelse page.pointers().len;
-    std.debug.print("separator insert index: {d} @ page {d} @ {*}\n", .{ insert_idx, parent_page_id, page });
-
-    const _value = old_page_id;
-    const value: []const u8 = @ptrCast(&_value);
-
-    const cell_size = key.len + value.len + @sizeOf(u64) * 2;
-    const needed_size = cell_size + @sizeOf(CellOffset);
-    if (page.header().freeSpace() < needed_size) {
-        const split_result = try self.split_page(
-            page,
-            path,
-            upper_bound_idx orelse page.pointers().len,
-            key,
-        );
-        target_page = split_result.target_page;
-        insert_idx = split_result.insert_idx;
-    }
-
-    writeCell(target_page, insert_idx, key, value);
-
-    if (insert_idx + 1 == target_page.pointers().len) {
-        std.debug.print("assigning right pointer\n", .{});
-        target_page.header().right_pointer = new_page_id;
+    if (hasRoom(page, key, value)) {
+        writeCell(target, insert_idx, key, value);
     } else {
-        std.debug.print("updating pointer to the right\n", .{});
-        const p: []const u8 = @ptrCast(&new_page_id);
-        var after_cell = target_page.cell(target_page.offset(insert_idx + 1));
-        @memcpy(after_cell.val(), p);
+        const result = try self.split_page(page, path, insert_idx, key);
+        target = result.target_page;
+        insert_idx = result.insert_idx;
+        writeCell(target, insert_idx, key, value);
     }
-    self.page_cache.mark_page_dirty(target_page);
+
+    if (insert_idx + 1 == target.pointers().len) {
+        target.header().right_pointer = new_page_id;
+    } else {
+        var after_cell = target.cell(target.offset(insert_idx + 1));
+        mem.writeInt(PageId, @ptrCast(after_cell.val()), new_page_id, .little);
+    }
+    self.page_cache.mark_page_dirty(target);
 }
 
 /// Only split `page` into two pages, without promoting a key
@@ -212,7 +181,6 @@ fn insert_separator(
 /// left: [1, 3, 4]
 /// right: [5, 6, 7]
 pub fn __split_page(self: *Self, page: *PageBuffer, out_separator_key: []u8) !*PageBuffer {
-    std.debug.print("splitting page {d}\n", .{page.page_id});
     const new_page_id = try self.page_cache.allocate();
     const new_page = try self.page_cache.get(new_page_id) orelse @panic("unreachable");
     new_page.header().* = .empty(page.header().type);
@@ -391,7 +359,7 @@ pub fn insert(
         path.deinit(self.allocator);
     }
 
-    const insert_idx = upperBound(page, key);
+    var insert_idx = upperBound(page, key);
     if (lookupCell(page, key, insert_idx) != null) return error.KeyAlreadyExists;
 
     if (hasRoom(page, key, value)) {
@@ -399,7 +367,8 @@ pub fn insert(
     } else {
         const result = try self.split_page(page, &path, insert_idx, key);
         target = result.target_page;
-        writeCell(target, result.insert_idx, key, value);
+        insert_idx = result.insert_idx;
+        writeCell(target, insert_idx, key, value);
     }
 
     self.page_cache.mark_page_dirty(target);

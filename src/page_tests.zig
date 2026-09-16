@@ -496,3 +496,49 @@ test "some tree" {
     // fails because 10 is less than 9 lexically, i should use alphabet or stop at 9
     //try std.testing.expectEqualStrings("nine", (try tree.find("9", &storage)).?);
 }
+
+// use large keys and values to acheive low fanout and split early.
+test "insert keys in ascending order" {
+    const io = std.testing.io;
+    const allocator = test_allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
+
+    var tree: Tree = try .empty(allocator, io, file);
+    defer tree.deinit();
+
+    var key: [1000]u8 = @splat(0);
+    var value: [700]u8 = @splat('v');
+
+    for (0..10) |i| {
+        _ = try fmt.bufPrint(key[0..20], "{d:0>20}", .{i});
+        try tree.insert(&key, &value);
+    }
+    try expectValidTree(&tree);
+}
+
+// use large keys and values to acheive low fanout and split early.
+test "insert keys in descending order" {
+    const io = std.testing.io;
+    const allocator = test_allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
+
+    var tree: Tree = try .empty(allocator, io, file);
+    defer tree.deinit();
+
+    var key: [1000]u8 = @splat(0);
+    var value: [700]u8 = @splat('v');
+
+    var i: usize = 10;
+    while (i > 0) {
+        i -= 1;
+        _ = try fmt.bufPrint(key[0..20], "{d:0>20}", .{i});
+        try tree.insert(&key, &value);
+    }
+    try expectValidTree(&tree);
+}

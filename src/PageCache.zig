@@ -116,9 +116,6 @@ pub fn put(self: *Self, page: *PageBuffer) void {
 pub fn deinit(self: *Self) void {
     var it = self.cache.iterator();
     while (it.next()) |entry| {
-        std.debug.print("freeing page: \n{f}\n", .{
-            entry.value_ptr.*,
-        });
         self.put(entry.value_ptr.*);
     }
     self.cache.deinit();
