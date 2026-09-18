@@ -59,43 +59,56 @@ pub fn build(b: *std.Build) void {
     // page cache enabled
     const options_enabled = b.addOptions();
     options_enabled.addOption(bool, "disable_page_cache", false);
-    const module_enabled = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = exe.root_module.resolved_target,
-        .optimize = exe.root_module.optimize,
-    });
-    module_enabled.addOptions("config", options_enabled);
-    const tests_cache_enabled = b.addTest(.{
-        .root_module = module_enabled,
-        .filters = test_filters,
-    });
-    const run_tests_cache_enabled = b.addRunArtifact(tests_cache_enabled);
-    const enabled_step = b.step(
+    addTestStep(
+        b,
+        target,
+        optimize,
+        test_step,
         "test-cache-enabled",
         "Run tests with page cache enabled",
+        test_filters,
+        options_enabled,
     );
-    enabled_step.dependOn(&run_tests_cache_enabled.step);
 
     // page cache disabled
     const options_disabled = b.addOptions();
     options_disabled.addOption(bool, "disable_page_cache", true);
-    const module_disabled = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = exe.root_module.resolved_target,
-        .optimize = exe.root_module.optimize,
-    });
-    module_disabled.addOptions("config", options_disabled);
-    const tests_cache_disabled = b.addTest(.{
-        .root_module = module_disabled,
-        .filters = test_filters,
-    });
-    const run_tests_cache_disabled = b.addRunArtifact(tests_cache_disabled);
-    const disabled_step = b.step(
+    addTestStep(
+        b,
+        target,
+        optimize,
+        test_step,
         "test-cache-disabled",
         "Run tests with page cache disabled",
+        test_filters,
+        options_disabled,
     );
-    disabled_step.dependOn(&run_tests_cache_disabled.step);
+}
 
-    test_step.dependOn(enabled_step);
-    test_step.dependOn(disabled_step);
+/// Add tests with `options` as its `config` module.
+fn addTestStep(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    test_step: *std.Build.Step,
+    name: []const u8,
+    description: []const u8,
+    filters: []const []const u8,
+    options: *std.Build.Step.Options,
+) void {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addOptions("config", options);
+    const tests = b.addTest(.{
+        .root_module = mod,
+        .filters = filters,
+    });
+    const run_tests_step = b.addRunArtifact(tests);
+    const step = b.step(name, description);
+    step.dependOn(&run_tests_step.step);
+
+    test_step.dependOn(step);
 }
