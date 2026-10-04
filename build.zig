@@ -58,7 +58,6 @@ pub fn build(b: *std.Build) void {
 
     // page cache enabled
     const options_enabled = b.addOptions();
-    options_enabled.addOption(bool, "disable_page_cache", false);
     addTestStep(
         b,
         target,
@@ -68,20 +67,6 @@ pub fn build(b: *std.Build) void {
         "Run tests with page cache enabled",
         test_filters,
         options_enabled,
-    );
-
-    // page cache disabled
-    const options_disabled = b.addOptions();
-    options_disabled.addOption(bool, "disable_page_cache", true);
-    addTestStep(
-        b,
-        target,
-        optimize,
-        test_step,
-        "test-cache-disabled",
-        "Run tests with page cache disabled",
-        test_filters,
-        options_disabled,
     );
 }
 
