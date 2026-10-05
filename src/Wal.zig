@@ -3,7 +3,24 @@ const std = @import("std");
 const mem = std.mem;
 const Io = std.Io;
 
-/// A write-ahead-log
+/// A write-ahead-log.
+///
+///
+/// # Example
+/// ```zig
+/// var wal = try Wal.open(io, dir);
+/// defer wal.deinit();
+///
+/// const lsn = try wal.append("set a 1");
+/// _ = try wal.append("set b 2");
+///
+/// // Replay records
+/// var it = wal.iter(allocator, 0);
+/// while (try it.next()) |record| {
+///     defer record.deinit(allocator);
+///     // apply
+/// }
+/// ```
 const Self = @This();
 
 /// Log Sequence Number (LSN).
