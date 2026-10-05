@@ -1,8 +1,11 @@
 const std = @import("std");
 const Io = std.Io;
 
+/// A write-ahead-log
 const Self = @This();
 
+/// Log Sequence Number (LSN).
+/// Internally, it represents a byte-offset in the WAL.
 const LSN = u64;
 
 dir: Io.Dir,
@@ -10,7 +13,6 @@ io: Io,
 file: Io.File,
 pos: usize,
 lock: std.Io.Mutex,
-lsn: LSN,
 
 pub const Entry = extern struct {
     len: u64,
@@ -36,11 +38,10 @@ pub fn open(io: Io, dir: Io.Dir) !Self {
         .file = file,
         .pos = stat.size,
         .lock = .init,
-        // TODO: persist
-        .lsn = 0,
     };
 }
 
+/// Append a WAL entry and return its LSN
 pub fn append(self: *Self, bytes: []const u8) !LSN {
     try self.lock.lock(self.io);
     defer self.lock.unlock(self.io);
@@ -50,10 +51,6 @@ pub fn append(self: *Self, bytes: []const u8) !LSN {
 
     self.pos += reserve;
     errdefer self.pos -= reserve;
-
-    const lsn = self.lsn;
-    self.lsn += 1;
-    errdefer self.lsn -= 1;
 
     var checksum = std.hash.Crc32.init();
 
@@ -73,7 +70,7 @@ pub fn append(self: *Self, bytes: []const u8) !LSN {
         @panic("fatal: fsync failure");
     };
 
-    return lsn;
+    return pos;
 }
 
 test {
@@ -82,9 +79,8 @@ test {
     defer tmp.cleanup();
 
     var wal = try Self.open(io, tmp.dir);
-    var lsn = try wal.append("inc 5");
-    try std.testing.expectEqual(0, lsn);
+    const first_lsn = try wal.append("inc 5");
+    const second_lsn = try wal.append("inc 5");
 
-    lsn = try wal.append("inc 5");
-    try std.testing.expectEqual(1, lsn);
+    try std.testing.expect(second_lsn > first_lsn);
 }
