@@ -45,6 +45,12 @@ pub const WalRecoveryError = error{
     InvalidRecord,
 } || Io.File.ReadPositionalError || mem.Allocator.Error;
 
+pub const max_segment_size: u64 = 16 * 1024 * 1024;
+const segment_name_prefix = "wal-";
+const segment_name_digits = 20;
+const segment_name_len = segment_name_prefix.len + segment_name_digits;
+pub const max_segment_name_len = segment_name_len;
+
 /// Open an existing WAL or create a new one.
 pub fn open(io: Io, dir: Io.Dir) !Self {
     const file = dir.openFile(io, "wal", .{
@@ -173,6 +179,23 @@ const WalIter = struct {
         };
     }
 };
+
+inline fn lsnToSegmentIdx(lsn: LSN) LSN {
+    return lsn / max_segment_size;
+}
+
+fn idxToSegmentName(buf: *[segment_name_len]u8, index: LSN) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}{d:0>20}", .{ segment_name_prefix, index }) catch unreachable;
+}
+
+fn nameToSegmentIdx(name: []const u8) !LSN {
+    if (!mem.startsWith(u8, name, segment_name_prefix))
+        return error.InvalidName;
+    const digits = name[segment_name_prefix.len..];
+    if (digits.len != segment_name_digits)
+        return error.InvalidName;
+    return std.fmt.parseInt(LSN, digits, 10) catch return error.InvalidName;
+}
 
 test {
     const allocator = std.testing.allocator;
