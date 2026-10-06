@@ -2,9 +2,11 @@ const std = @import("std");
 
 const mem = std.mem;
 const Io = std.Io;
+const assert = std.debug.assert;
 
 /// A write-ahead-log.
 ///
+/// This WAL is physically segmented but the API provides a logically contiguous stream of logs.
 ///
 /// # Example
 /// ```zig
@@ -32,6 +34,7 @@ io: Io,
 file: Io.File,
 pos: LSN,
 lock: std.Io.Mutex,
+segment_size: u64,
 
 pub const Header = extern struct {
     len: u64,
@@ -51,8 +54,21 @@ const segment_name_digits = 20;
 const segment_name_len = segment_name_prefix.len + segment_name_digits;
 pub const max_segment_name_len = segment_name_len;
 
+comptime {
+    assert(max_segment_size % 8 == 0);
+}
+
+/// Align `len` to multiple of 8
+inline fn alignRecord(len: usize) usize {
+    return mem.alignForward(usize, len, 8);
+}
+
 /// Open an existing WAL or create a new one.
 pub fn open(io: Io, dir: Io.Dir) !Self {
+    return openWithSegmentSize(io, dir, max_segment_size);
+}
+
+pub fn openWithSegmentSize(io: Io, dir: Io.Dir, segment_size: u64) !Self {
     const file = dir.openFile(io, "wal", .{
         .allow_directory = false,
         .follow_symlinks = false,
@@ -71,6 +87,7 @@ pub fn open(io: Io, dir: Io.Dir) !Self {
         .file = file,
         .pos = stat.size,
         .lock = .init,
+        .segment_size = segment_size,
     };
 }
 
@@ -83,7 +100,7 @@ pub fn append(self: *Self, bytes: []const u8) !LSN {
     try self.lock.lock(self.io);
     defer self.lock.unlock(self.io);
 
-    const reserve = bytes.len + @sizeOf(Header);
+    const reserve = alignRecord(bytes.len + @sizeOf(Header));
     const pos = self.pos;
 
     self.pos += reserve;
@@ -100,7 +117,7 @@ pub fn append(self: *Self, bytes: []const u8) !LSN {
         .len = bytes.len,
     };
     const written = try self.file.writePositional(self.io, &.{ @ptrCast(&entry), bytes }, pos);
-    if (written != reserve)
+    if (written != bytes.len + @sizeOf(Header))
         return error.Incomplete; // TODO: retry the write
 
     self.file.sync(self.io) catch {
@@ -172,7 +189,7 @@ const WalIter = struct {
         if (checksum.final() != header.checksum)
             return WalRecoveryError.ChecksumMismatch;
 
-        self.start += header.len + @sizeOf(Header);
+        self.start += alignRecord(header.len + @sizeOf(Header));
 
         return .{
             .buffer = buf,
