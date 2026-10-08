@@ -57,6 +57,9 @@ const segment_name_prefix = "wal-";
 const segment_name_digits = 20;
 const segment_name_len = segment_name_prefix.len + segment_name_digits;
 
+/// 1 GB
+const max_record_size = 1 * 1024 * 1024 * 1024;
+
 comptime {
     assert(default_segment_size % 8 == 0);
 }
@@ -102,9 +105,12 @@ pub fn deinit(self: *Self) void {
 
 /// Append a WAL entry and return its LSN
 pub fn append(self: *Self, bytes: []const u8) !LSN {
+    if (bytes.len > max_record_size)
+        return error.RecordTooLarge;
+        
     try self.lock.lock(self.io);
     defer self.lock.unlock(self.io);
-    
+
     const original_pos = self.pos;
     errdefer self.pos = original_pos;
 
@@ -128,7 +134,7 @@ pub fn append(self: *Self, bytes: []const u8) !LSN {
         pad[0..pad_len],
     };
 
-    var cursor: stdx.IoVecCursor(record.len) = .init(&record);
+    var cursor: stdx.IoVecCursor(record.len, false) = .init(&record);
     while (!cursor.isDone()) {
         const available = self.segment_size - self.pos;
         if (available == 0) {
@@ -194,23 +200,45 @@ const WalIter = struct {
         if (self.start == self.wal.pos)
             return null;
 
+        const record_base = self.start;
         var header: Header = undefined;
-        var nread = try self.wal.file.readPositionalAll(self.io, @ptrCast(&header), self.start);
 
-        if (nread != @sizeOf(Header))
+        var record_len: u64 = undefined;
+        var nread = try self.wal.file.readPositionalAll(self.io, @ptrCast(&record_len), self.start);
+        // there is always space for `length` (8 bytes) in a segment,
+        // because records are padded to be aligned to 8 bytes. if not,
+        // then something is wrong.
+        if (nread != @sizeOf(u64))
             return WalRecoveryError.InvalidRecord;
 
-        const remaining = self.wal.pos - self.start - @sizeOf(Header);
-        if (header.len > remaining)
+        header.len = record_len;
+
+        // protect against corrupted lengths to avoid OOM
+        if (header.len > max_record_size)
             return WalRecoveryError.InvalidRecord;
 
-        const buf = try self.allocator.alloc(u8, header.len);
+        const buf = try self.allocator.alloc(u8, record_len);
         errdefer self.allocator.free(buf);
 
-        nread = try self.wal.file.readPositionalAll(self.io, buf, self.start + @sizeOf(Header));
+        const header_bytes: []u8 = std.mem.asBytes(&header);
+        const iovec: [2][]u8 = .{
+            header_bytes[@offsetOf(Header, "checksum")..],
+            buf,
+        };
+        var cursor: stdx.IoVecCursor(2, true) = .init(&iovec);
 
-        if (nread != header.len)
-            return WalRecoveryError.InvalidRecord;
+        var pos = record_base + @sizeOf(u64);
+        while (!cursor.isDone()) {
+            const remaining = self.wal.pos - pos;
+            if (remaining == 0) {
+                @panic("unimplemented: roll to next file");
+            }
+
+            nread = try self.wal.file.readPositional(self.io, cursor.peek(remaining), pos);
+
+            cursor.advance(nread);
+            pos += nread;
+        }
 
         var checksum = std.hash.Crc32.init();
 
@@ -221,7 +249,7 @@ const WalIter = struct {
         if (checksum.final() != header.checksum)
             return WalRecoveryError.ChecksumMismatch;
 
-        self.start += alignRecord(header.len + @sizeOf(Header));
+        self.start = record_base + alignRecord(header.len + @sizeOf(Header));
 
         return .{
             .buffer = buf,
@@ -323,7 +351,7 @@ test "append a record that crosses a segment boundary" {
 
     wal = try Self.openWithSegmentSize(io, tmp.dir, 64);
     var it = wal.iter(allocator, 0);
-    
+
     const entry = try it.next();
     defer entry.?.deinit(allocator);
 

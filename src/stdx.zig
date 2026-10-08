@@ -125,23 +125,25 @@ pub fn xxd(io: std.Io, buffer: []const u8) !void {
 ///         file_len += written;
 ///     }
 ///     ```
+/// 3. Read an iovec that spans multiple files.
 ///
 /// Note: the iovec returned by `peek` is only valid until the next `peek`, because it's stored in
 /// the internal `buf`
-pub fn IoVecCursor(comptime n: usize) type {
+pub fn IoVecCursor(comptime n: usize, comptime mut: bool) type {
     return struct {
         const Self = @This();
+        const Slice = if (mut) []u8 else []const u8;
 
         /// The caller's iovec
-        vec: *const [n][]const u8,
+        vec: *const [n]Slice,
         /// Index of the buffer the cursor points at (buffer with unconsumed bytes)
         idx: usize = 0,
         /// Bytes already confused from `vec[idx]`
         off: usize = 0,
         // Backing storage for the iovec returned by `peek`
-        buf: [n][]const u8 = undefined,
+        buf: [n]Slice = undefined,
 
-        pub fn init(vec: *const [n][]const u8) Self {
+        pub fn init(vec: *const [n]Slice) Self {
             var c: Self = .{ .vec = vec };
             c.skipEmpty();
             return c;
@@ -161,7 +163,7 @@ pub fn IoVecCursor(comptime n: usize) type {
 
         /// The returned iovec is valid until the next `peek` and is
         /// tied to lifetime of the cursor.
-        pub fn peek(self: *Self, budget: usize) []const []const u8 {
+        pub fn peek(self: *Self, budget: usize) []const Slice {
             var used: usize = 0;
             var left = budget;
             var i = self.idx;
@@ -180,7 +182,7 @@ pub fn IoVecCursor(comptime n: usize) type {
             return self.buf[0..used];
         }
 
-        pub fn peekAll(self: *Self) []const []const u8 {
+        pub fn peekAll(self: *Self) []const Slice {
             return self.peek(std.math.maxInt(usize));
         }
 
@@ -213,7 +215,7 @@ pub fn IoVecCursor(comptime n: usize) type {
 
 test "VecCursor splits across budgets and short writes" {
     const v = [_][]const u8{ "abc", "", "defg", "h" };
-    var c: IoVecCursor(v.len) = .init(&v);
+    var c: IoVecCursor(v.len, false) = .init(&v);
 
     // "abc","de"
     const a = c.peek(5);
@@ -234,4 +236,51 @@ test "VecCursor splits across budgets and short writes" {
     c.advance(4);
 
     try std.testing.expect(c.isDone());
+}
+
+test "IoVecCursor fills mutable buffers across budgets and short reads" {
+    var a_buf: [3]u8 = undefined;
+    var b_buf: [4]u8 = undefined;
+    var c_buf: [1]u8 = undefined;
+    var iovec = [_][]u8{ &a_buf, &b_buf, &c_buf };
+    var cursor: IoVecCursor(iovec.len, true) = .init(&iovec);
+
+    const source = "abcdefgh";
+    var src_pos: usize = 0;
+
+    // Budget 5 trims to a_buf (3) and the first 2 bytes of b_buf.
+    const first = cursor.peek(5);
+    try std.testing.expectEqual(2, first.len);
+    try std.testing.expectEqual(3, first[0].len);
+    try std.testing.expectEqual(2, first[1].len);
+
+    // Short read: only 4 bytes were read. 
+    // simulate a short-read from a file:
+    var got: usize = 4;
+    for (first) |dst| {
+        const n = @min(dst.len, got);
+        @memcpy(dst[0..n], source[src_pos..][0..n]);
+        src_pos += n;
+        got -= n;
+    }
+    cursor.advance(4);
+
+    // 3 bytes left in b_buf, and 1 in c_buf.
+    try std.testing.expectEqual(4, cursor.remaining());
+    const second = cursor.peek(100);
+    try std.testing.expectEqual(2, second.len);
+    try std.testing.expectEqual(3, second[0].len);
+    try std.testing.expectEqual(1, second[1].len);
+
+    // single full read
+    for (second) |dst| {
+        @memcpy(dst, source[src_pos..][0..dst.len]);
+        src_pos += dst.len;
+    }
+    cursor.advance(4);
+
+    try std.testing.expect(cursor.isDone());
+    try std.testing.expectEqualStrings("abc", &a_buf);
+    try std.testing.expectEqualStrings("defg", &b_buf);
+    try std.testing.expectEqualStrings("h", &c_buf);
 }
