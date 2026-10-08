@@ -26,10 +26,6 @@ const assert = std.debug.assert;
 /// ```
 const Self = @This();
 
-/// Log Sequence Number (LSN).
-/// Internally, it represents a byte-offset in the WAL.
-const LSN = u64;
-
 dir: Io.Dir,
 io: Io,
 file: Io.File,
@@ -39,6 +35,14 @@ pos: LSN,
 lsn: LSN,
 lock: std.Io.Mutex,
 segment_size: u64,
+mode: Mode,
+
+/// Log Sequence Number (LSN).
+/// Internally, it represents a byte-offset in the WAL.
+const LSN = u64;
+const SegmentIdx = u64;
+
+const Mode = enum { recovery, append };
 
 pub const Header = extern struct {
     len: u64,
@@ -50,7 +54,7 @@ pub const WalRecoveryError = error{
     ChecksumMismatch,
     /// Invalid length or truncated record
     InvalidRecord,
-} || Io.File.ReadPositionalError || mem.Allocator.Error;
+} || Io.File.ReadPositionalError || mem.Allocator.Error || Io.File.OpenError;
 
 pub const default_segment_size: u64 = 16 * 1024 * 1024;
 const segment_name_prefix = "wal-";
@@ -75,27 +79,33 @@ pub fn open(io: Io, dir: Io.Dir) !Self {
 }
 
 pub fn openWithSegmentSize(io: Io, dir: Io.Dir, segment_size: u64) !Self {
-    const file = dir.openFile(io, "wal", .{
+    const first_segment_name = idxToSegmentName(0);
+    // start in recovery mode, unless we create a fresh WAL.
+    var mode: Mode = .recovery;
+
+    const file = dir.openFile(io, &first_segment_name, .{
         .allow_directory = false,
         .follow_symlinks = false,
         .mode = .read_write,
     }) catch |e| switch (e) {
         error.FileNotFound => blk: {
-            break :blk try dir.createFile(io, "wal", .{ .read = true });
+            mode = .append;
+            break :blk try dir.createFile(io, &first_segment_name, .{ .read = true });
         },
         else => return e,
     };
 
-    const stat = try file.stat(io);
     return .{
         .dir = dir,
         .io = io,
         .file = file,
-        .pos = stat.size,
-        // TODO: (highest_idx - 1) * segment_size + last_idx_stat.size
-        .lsn = stat.size,
         .lock = .init,
         .segment_size = segment_size,
+        .mode = mode,
+        // recovery will take care of setting `pos` and `len`
+        // to their latest value.
+        .pos = 0,
+        .lsn = 0,
     };
 }
 
@@ -103,11 +113,32 @@ pub fn deinit(self: *Self) void {
     self.file.close(self.io);
 }
 
+/// Return the index of the last segment in
+/// the WAL directory.
+fn lastSegmentIdx(io: Io, dir: Io.Dir) !?SegmentIdx {
+    const it = dir.iterate();
+
+    var highest: ?SegmentIdx = null;
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) @panic("unexpected entry in WAL directory");
+        const idx = nameToSegmentIdx(entry.name) catch @panic("unexpected file in WAL directory");
+        if (highest) |max| {
+            highest = @max(max, idx);
+        } else {
+            highest = idx;
+        }
+    }
+
+    return highest;
+}
+
 /// Append a WAL entry and return its LSN
 pub fn append(self: *Self, bytes: []const u8) !LSN {
+    assert(self.mode == .append);
+
     if (bytes.len > max_record_size)
         return error.RecordTooLarge;
-        
+
     try self.lock.lock(self.io);
     defer self.lock.unlock(self.io);
 
@@ -159,8 +190,7 @@ pub fn append(self: *Self, bytes: []const u8) !LSN {
 fn rotate(self: *Self) !void {
     assert(self.pos == self.segment_size);
     const idx = self.lsnToSegmentIdx(self.pos + 1);
-    var file_name: [segment_name_len]u8 = undefined;
-    _ = idxToSegmentName(&file_name, idx);
+    const file_name = idxToSegmentName(idx);
     self.file = try self.dir.createFile(self.io, &file_name, .{ .read = true });
     self.pos = 0;
 }
@@ -175,15 +205,37 @@ const Record = struct {
 
 /// Return an iterator over the WAL records starting from `pos`
 ///
+/// If all records were processed correctly, then the WAL will switch to append mode.
+///
 /// # Example
 /// ```zig
-/// var it = wal.iter(allocator, pos);
+/// var it = wal.iter(allocator, checkpoint);
 /// const record = try it.next();
 /// assert(record != null);
 /// ```
-pub fn iter(self: *Self, allocator: mem.Allocator, pos: LSN) WalIter {
+pub fn iter(self: *Self, allocator: mem.Allocator, pos: LSN) !WalIter {
+    assert(self.mode == .recovery);
+
+    const idx = self.lsnToSegmentIdx(pos);
+    const name = idxToSegmentName(idx);
+
+    // TODO: we're also opening/creating the first WAL in `open`
+    // I think the correct API is open(io, dir, ?checkpoint) / iter(alloc)
+    // so we open checkpoint segment first thing, or we create a new WAL if no checkpoint
+    // we can also quickly detect bogus checkpoints.
+    self.file = self.dir.openFile(self.io, &name, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .mode = .read_write,
+    }) catch |e| switch (e) {
+        error.FileNotFound => @panic("the segment for `checkpoint` does not exist"),
+        else => return e,
+    };
+
+    self.lsn = pos;
+    self.pos = pos % self.segment_size;
+
     return .{
-        .start = pos,
         .wal = self,
         .allocator = allocator,
         .io = self.io,
@@ -193,18 +245,37 @@ pub fn iter(self: *Self, allocator: mem.Allocator, pos: LSN) WalIter {
 const WalIter = struct {
     allocator: mem.Allocator,
     io: Io,
-    wal: *const Self,
-    start: LSN = 0,
+    wal: *Self,
+
+    /// Open the segment containing `self.start`
+    pub fn openSegment(self: *@This()) !void {
+        const idx = self.wal.lsnToSegmentIdx(self.wal.lsn);
+        const name = idxToSegmentName(idx);
+        self.wal.file.close(self.io);
+        self.wal.file = self.wal.dir.openFile(self.io, &name, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .mode = .read_write,
+        }) catch |e| switch (e) {
+            error.FileNotFound => @panic("the segment for `lsn` does not exist"),
+            else => return e,
+        };
+
+        self.wal.pos = 0;
+    }
 
     pub fn next(self: *@This()) WalRecoveryError!?Record {
-        if (self.start == self.wal.pos)
-            return null;
-
-        const record_base = self.start;
         var header: Header = undefined;
 
         var record_len: u64 = undefined;
-        var nread = try self.wal.file.readPositionalAll(self.io, @ptrCast(&record_len), self.start);
+        var nread = try self.wal.file.readPositionalAll(self.io, @ptrCast(&record_len), self.wal.pos);
+
+        // we have reached the end of the WAL
+        if (nread == 0) {
+            self.wal.mode = .append;
+            return null;
+        }
+
         // there is always space for `length` (8 bytes) in a segment,
         // because records are padded to be aligned to 8 bytes. if not,
         // then something is wrong.
@@ -212,6 +283,8 @@ const WalIter = struct {
             return WalRecoveryError.InvalidRecord;
 
         header.len = record_len;
+        self.wal.pos += @sizeOf(u64);
+        self.wal.lsn += @sizeOf(u64);
 
         // protect against corrupted lengths to avoid OOM
         if (header.len > max_record_size)
@@ -227,17 +300,17 @@ const WalIter = struct {
         };
         var cursor: stdx.IoVecCursor(2, true) = .init(&iovec);
 
-        var pos = record_base + @sizeOf(u64);
         while (!cursor.isDone()) {
-            const remaining = self.wal.pos - pos;
+            const remaining = self.wal.segment_size - self.wal.pos;
             if (remaining == 0) {
-                @panic("unimplemented: roll to next file");
+                try self.openSegment();
             }
 
-            nread = try self.wal.file.readPositional(self.io, cursor.peek(remaining), pos);
+            nread = try self.wal.file.readPositional(self.io, cursor.peek(remaining), self.wal.pos);
 
             cursor.advance(nread);
-            pos += nread;
+            self.wal.pos += nread;
+            self.wal.lsn += nread;
         }
 
         var checksum = std.hash.Crc32.init();
@@ -249,7 +322,8 @@ const WalIter = struct {
         if (checksum.final() != header.checksum)
             return WalRecoveryError.ChecksumMismatch;
 
-        self.start = record_base + alignRecord(header.len + @sizeOf(Header));
+        self.wal.pos = alignRecord(self.wal.pos);
+        self.wal.lsn = alignRecord(self.wal.lsn);
 
         return .{
             .buffer = buf,
@@ -261,8 +335,12 @@ inline fn lsnToSegmentIdx(self: *Self, lsn: LSN) LSN {
     return lsn / self.segment_size;
 }
 
-fn idxToSegmentName(buf: *[segment_name_len]u8, index: LSN) []const u8 {
-    return mem.print(buf, "{s}{d:0>20}", .{ segment_name_prefix, index }) catch unreachable;
+fn idxToSegmentName(index: LSN) [segment_name_len]u8 {
+    var buf: [segment_name_len]u8 = undefined;
+    const ret = mem.print(&buf, "{s}{d:0>20}", .{ segment_name_prefix, index }) catch unreachable;
+    assert(ret.len == segment_name_len);
+
+    return buf;
 }
 
 fn nameToSegmentIdx(name: []const u8) !LSN {
@@ -287,7 +365,10 @@ test "append and iterate" {
     try std.testing.expectEqual(0, first_lsn);
     try std.testing.expect(second_lsn > first_lsn);
 
-    var it = wal.iter(allocator, 0);
+    wal.deinit();
+    wal = try Self.open(io, tmp.dir);
+
+    var it = try wal.iter(allocator, 0);
 
     const e1 = try it.next();
     defer e1.?.deinit(allocator);
@@ -313,7 +394,10 @@ test "iter detects corruption of an entry" {
     const payload_offset = @sizeOf(Header);
     try wal.file.writePositionalAll(io, "X", payload_offset);
 
-    var it = wal.iter(allocator, 0);
+    wal.deinit();
+    wal = try Self.open(io, tmp.dir);
+
+    var it = try wal.iter(allocator, 0);
     try std.testing.expectError(WalRecoveryError.ChecksumMismatch, it.next());
 }
 
@@ -330,7 +414,10 @@ test "iter rejects a length that overflows the log" {
     const corrupted_len: u64 = 1 << 40;
     try wal.file.writePositionalAll(io, @ptrCast(&corrupted_len), 0);
 
-    var it = wal.iter(allocator, 0);
+    wal.deinit();
+    wal = try Self.open(io, tmp.dir);
+
+    var it = try wal.iter(allocator, 0);
     try std.testing.expectError(WalRecoveryError.InvalidRecord, it.next());
 }
 
@@ -345,19 +432,30 @@ test "append a record that crosses a segment boundary" {
 
     const filler: [40]u8 = @splat(0);
     _ = try wal.append(&filler);
-    // only 8 bytes are available in the segment now
 
+    // only 8 bytes are available in the segment now
     _ = try wal.append("test");
+    _ = try wal.append("foobar");
 
     wal = try Self.openWithSegmentSize(io, tmp.dir, 64);
-    var it = wal.iter(allocator, 0);
+    var it = try wal.iter(allocator, 0);
 
     const entry = try it.next();
     defer entry.?.deinit(allocator);
 
     try std.testing.expectEqualSlices(u8, &filler, entry.?.buffer);
 
-    // TODO: wal iterator doesn't read across segments yet
-    const entry2 = it.next();
-    try std.testing.expectError(WalRecoveryError.InvalidRecord, entry2);
+    const entry2 = try it.next();
+    defer entry2.?.deinit(allocator);
+
+    try std.testing.expectEqualSlices(u8, "test", entry2.?.buffer);
+
+    const entry3 = try it.next();
+    defer entry3.?.deinit(allocator);
+
+    try std.testing.expectEqualSlices(u8, "foobar", entry3.?.buffer);
+
+    try std.testing.expectEqual(.recovery, wal.mode);
+    try std.testing.expectEqual(null, try it.next());
+    try std.testing.expectEqual(.append, wal.mode);
 }
