@@ -11,14 +11,14 @@ const assert = std.debug.assert;
 ///
 /// # Example
 /// ```zig
-/// var wal = try Wal.open(allocator, io, dir, null);
+/// var wal = try Wal.open(io, dir, null);
 /// defer wal.deinit();
 ///
 /// const lsn = try wal.append("set a 1");
 /// _ = try wal.append("set b 2");
 ///
 /// // Replay records
-/// while (try wal.next()) |record| {
+/// while (try wal.next(allocator)) |record| {
 ///     defer record.deinit(allocator);
 ///     // apply
 /// }
@@ -35,7 +35,6 @@ lsn: LSN,
 lock: std.Io.Mutex,
 segment_size: u64,
 mode: Mode,
-allocator: mem.Allocator,
 
 /// Log Sequence Number (LSN).
 /// Internally, it represents a byte-offset in the WAL.
@@ -74,11 +73,11 @@ inline fn alignRecord(len: usize) usize {
 }
 
 /// Open an existing WAL or create a new one.
-pub fn open(allocator: mem.Allocator, io: Io, dir: Io.Dir, checkpoint: ?LSN) !Self {
-    return openWithSegmentSize(allocator, io, dir, default_segment_size, checkpoint);
+pub fn open(io: Io, dir: Io.Dir, checkpoint: ?LSN) !Self {
+    return openWithSegmentSize(io, dir, default_segment_size, checkpoint);
 }
 
-pub fn openWithSegmentSize(allocator: mem.Allocator, io: Io, dir: Io.Dir, segment_size: u64, checkpoint: ?LSN) !Self {
+pub fn openWithSegmentSize(io: Io, dir: Io.Dir, segment_size: u64, checkpoint: ?LSN) !Self {
     // start in recovery mode, unless we create a fresh WAL.
     var mode: Mode = .recovery;
 
@@ -131,7 +130,6 @@ pub fn openWithSegmentSize(allocator: mem.Allocator, io: Io, dir: Io.Dir, segmen
         // to their latest value, starting from `checkpoint`.
         .pos = pos,
         .lsn = lsn,
-        .allocator = allocator,
     };
 }
 
@@ -261,7 +259,7 @@ fn nextSegment(self: *Self) !bool {
     return true;
 }
 
-pub fn next(self: *@This()) WalRecoveryError!?Record {
+pub fn next(self: *@This(), allocator: mem.Allocator) WalRecoveryError!?Record {
     var header: Header = undefined;
 
     // A record may end exactly at a segment boundary, leaving the next
@@ -294,8 +292,8 @@ pub fn next(self: *@This()) WalRecoveryError!?Record {
     if (header.len > max_record_size)
         return WalRecoveryError.InvalidRecord;
 
-    const buf = try self.allocator.alloc(u8, record_len);
-    errdefer self.allocator.free(buf);
+    const buf = try allocator.alloc(u8, record_len);
+    errdefer allocator.free(buf);
 
     const header_bytes: []u8 = std.mem.asBytes(&header);
     const iovec: [2][]u8 = .{
@@ -362,7 +360,7 @@ test "append and iterate" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var wal = try Self.open(allocator, io, tmp.dir, null);
+    var wal = try Self.open(io, tmp.dir, null);
     const first_lsn = try wal.append("inc 5");
     const second_lsn = try wal.append("inc 3");
 
@@ -370,17 +368,17 @@ test "append and iterate" {
     try std.testing.expect(second_lsn > first_lsn);
 
     wal.deinit();
-    wal = try Self.open(allocator, io, tmp.dir, null);
+    wal = try Self.open(io, tmp.dir, null);
 
-    const e1 = try wal.next();
+    const e1 = try wal.next(allocator);
     defer e1.?.deinit(allocator);
     try std.testing.expectEqualSlices(u8, "inc 5", e1.?.buffer);
 
-    const e2 = try wal.next();
+    const e2 = try wal.next(allocator);
     defer e2.?.deinit(allocator);
     try std.testing.expectEqualSlices(u8, "inc 3", e2.?.buffer);
 
-    try std.testing.expectEqual(null, try wal.next());
+    try std.testing.expectEqual(null, try wal.next(allocator));
 }
 
 test "iter detects corruption of an entry" {
@@ -389,7 +387,7 @@ test "iter detects corruption of an entry" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var wal = try Self.open(allocator, io, tmp.dir, null);
+    var wal = try Self.open(io, tmp.dir, null);
     _ = try wal.append("inc 5");
 
     // change one byte of the entry.
@@ -397,9 +395,9 @@ test "iter detects corruption of an entry" {
     try wal.file.writePositionalAll(io, "X", payload_offset);
 
     wal.deinit();
-    wal = try Self.open(allocator, io, tmp.dir, null);
+    wal = try Self.open(io, tmp.dir, null);
 
-    try std.testing.expectError(WalRecoveryError.ChecksumMismatch, wal.next());
+    try std.testing.expectError(WalRecoveryError.ChecksumMismatch, wal.next(allocator));
 }
 
 test "iter rejects a length that overflows the log" {
@@ -408,7 +406,7 @@ test "iter rejects a length that overflows the log" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var wal = try Self.open(allocator, io, tmp.dir, null);
+    var wal = try Self.open(io, tmp.dir, null);
     defer wal.deinit();
     _ = try wal.append("inc 5");
 
@@ -416,9 +414,9 @@ test "iter rejects a length that overflows the log" {
     try wal.file.writePositionalAll(io, @ptrCast(&corrupted_len), 0);
 
     wal.deinit();
-    wal = try Self.open(allocator, io, tmp.dir, null);
+    wal = try Self.open(io, tmp.dir, null);
 
-    try std.testing.expectError(WalRecoveryError.InvalidRecord, wal.next());
+    try std.testing.expectError(WalRecoveryError.InvalidRecord, wal.next(allocator));
 }
 
 test "append a record that crosses a segment boundary" {
@@ -427,7 +425,7 @@ test "append a record that crosses a segment boundary" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var wal = try Self.openWithSegmentSize(allocator, io, tmp.dir, 64, null);
+    var wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
     defer wal.deinit();
 
     const filler: [40]u8 = @splat(0);
@@ -437,25 +435,25 @@ test "append a record that crosses a segment boundary" {
     _ = try wal.append("test");
     _ = try wal.append("foobar");
 
-    wal = try Self.openWithSegmentSize(allocator, io, tmp.dir, 64, null);
+    wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
 
-    const entry = try wal.next();
+    const entry = try wal.next(allocator);
     defer entry.?.deinit(allocator);
 
     try std.testing.expectEqualSlices(u8, &filler, entry.?.buffer);
 
-    const entry2 = try wal.next();
+    const entry2 = try wal.next(allocator);
     defer entry2.?.deinit(allocator);
 
     try std.testing.expectEqualSlices(u8, "test", entry2.?.buffer);
 
-    const entry3 = try wal.next();
+    const entry3 = try wal.next(allocator);
     defer entry3.?.deinit(allocator);
 
     try std.testing.expectEqualSlices(u8, "foobar", entry3.?.buffer);
 
     try std.testing.expectEqual(.recovery, wal.mode);
-    try std.testing.expectEqual(null, try wal.next());
+    try std.testing.expectEqual(null, try wal.next(allocator));
     try std.testing.expectEqual(.append, wal.mode);
 }
 
@@ -465,7 +463,7 @@ test "recovery continues past a record ending exactly at a segment boundary" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var wal = try Self.openWithSegmentSize(allocator, io, tmp.dir, 64, null);
+    var wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
 
     // header (16) + 48 bytes = 64, so the record ends exactly at the segment boundary.
     const filler: [48]u8 = @splat(42);
@@ -473,16 +471,16 @@ test "recovery continues past a record ending exactly at a segment boundary" {
     _ = try wal.append("after-boundary");
 
     wal.deinit();
-    wal = try Self.openWithSegmentSize(allocator, io, tmp.dir, 64, null);
+    wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
     defer wal.deinit();
 
-    const entry = try wal.next();
+    const entry = try wal.next(allocator);
     defer entry.?.deinit(allocator);
 
     try std.testing.expectEqualSlices(u8, &filler, entry.?.buffer);
 
     // This should be the record in the next segment, but recovery stops at the boundary.
-    const entry2 = try wal.next();
+    const entry2 = try wal.next(allocator);
     try std.testing.expect(entry2 != null);
     defer if (entry2) |e| e.deinit(allocator);
     try std.testing.expectEqualSlices(u8, "after-boundary", entry2.?.buffer);
@@ -494,7 +492,7 @@ test "append across three segments recovers all records" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var wal = try Self.openWithSegmentSize(allocator, io, tmp.dir, 64, null);
+    var wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
 
     // Each 48-byte payload plus the 16-byte header fills a 64-byte segment exactly,
     // forcing a rotate into a new segment before each record.
@@ -506,22 +504,22 @@ test "append across three segments recovers all records" {
     _ = try wal.append(&three);
 
     wal.deinit();
-    wal = try Self.openWithSegmentSize(allocator, io, tmp.dir, 64, null);
+    wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
     defer wal.deinit();
 
-    const e1 = try wal.next();
+    const e1 = try wal.next(allocator);
     defer e1.?.deinit(allocator);
     try std.testing.expectEqualSlices(u8, &one, e1.?.buffer);
 
-    const e2 = try wal.next();
+    const e2 = try wal.next(allocator);
     defer e2.?.deinit(allocator);
     try std.testing.expectEqualSlices(u8, &two, e2.?.buffer);
 
-    const e3 = try wal.next();
+    const e3 = try wal.next(allocator);
     defer e3.?.deinit(allocator);
     try std.testing.expectEqualSlices(u8, &three, e3.?.buffer);
 
-    try std.testing.expectEqual(null, try wal.next());
+    try std.testing.expectEqual(null, try wal.next(allocator));
 }
 
 test "detect a truncated record" {
@@ -530,7 +528,7 @@ test "detect a truncated record" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var wal = try Self.open(allocator, io, tmp.dir, null);
+    var wal = try Self.open(io, tmp.dir, null);
     _ = try wal.append("inc 5");
 
     // XXX: truncate file
@@ -538,8 +536,8 @@ test "detect a truncated record" {
     try wal.file.setLength(io, stat.size - 4);
 
     wal.deinit();
-    wal = try Self.open(allocator, io, tmp.dir, null);
+    wal = try Self.open(io, tmp.dir, null);
     defer wal.deinit();
 
-    try std.testing.expectError(WalRecoveryError.InvalidRecord, wal.next());
+    try std.testing.expectError(WalRecoveryError.InvalidRecord, wal.next(allocator));
 }
