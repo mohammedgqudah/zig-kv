@@ -89,9 +89,6 @@ pub fn allocate(self: *Self) !PageId {
 /// // modify the page
 /// ```
 pub fn get(self: *Self, id: PageId) !?*PageBuffer {
-    if (config.disable_page_cache) {
-        return self.load_page(id);
-    }
     const result = try self.cache.getOrPut(id);
 
     if (!result.found_existing) {

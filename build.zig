@@ -58,8 +58,7 @@ pub fn build(b: *std.Build) void {
 
     // page cache enabled
     const options_enabled = b.addOptions();
-    options_enabled.addOption(bool, "disable_page_cache", false);
-    addTestStep(
+    const tests = addTestStep(
         b,
         target,
         optimize,
@@ -70,19 +69,12 @@ pub fn build(b: *std.Build) void {
         options_enabled,
     );
 
-    // page cache disabled
-    const options_disabled = b.addOptions();
-    options_disabled.addOption(bool, "disable_page_cache", true);
-    addTestStep(
-        b,
-        target,
-        optimize,
-        test_step,
-        "test-cache-disabled",
-        "Run tests with page cache disabled",
-        test_filters,
-        options_disabled,
-    );
+    // debug
+    const debug_step = b.step("debug", "Debug the test artifact with lldb");
+    const lldb_cmd = b.addSystemCommand(&.{"lldb"});
+    lldb_cmd.addArtifactArg(tests);
+    lldb_cmd.addPassthruArgs();
+    debug_step.dependOn(&lldb_cmd.step);
 }
 
 /// Add tests with `options` as its `config` module.
@@ -95,7 +87,7 @@ fn addTestStep(
     description: []const u8,
     filters: []const []const u8,
     options: *std.Build.Step.Options,
-) void {
+) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -105,10 +97,14 @@ fn addTestStep(
     const tests = b.addTest(.{
         .root_module = mod,
         .filters = filters,
+        .use_llvm = true,
     });
     const run_tests_step = b.addRunArtifact(tests);
     const step = b.step(name, description);
     step.dependOn(&run_tests_step.step);
 
     test_step.dependOn(step);
+
+    test_step.dependOn(&b.addInstallArtifact(tests, .{}).step);
+    return tests;
 }

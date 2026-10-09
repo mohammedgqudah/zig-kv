@@ -183,7 +183,7 @@ test "it finds keys in a leaf root node" {
     try std.testing.expect(result.cell == null);
 }
 
-test {
+test "insert then find reloaded tree" {
     const io = std.testing.io;
     const allocator = test_allocator;
     var tmp = std.testing.tmpDir(.{});
