@@ -148,7 +148,7 @@ pub fn IoVecCursor(comptime n: usize, comptime mut: bool) type {
         vec: *const [n]Slice,
         /// Index of the buffer the cursor points at (buffer with unconsumed bytes)
         idx: usize = 0,
-        /// Bytes already confused from `vec[idx]`
+        /// Bytes already consumed from `vec[idx]`
         off: usize = 0,
         // Backing storage for the iovec returned by `peek`
         buf: [n]Slice = undefined,
