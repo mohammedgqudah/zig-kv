@@ -137,25 +137,6 @@ pub fn deinit(self: *Self) void {
     self.file.close(self.io);
 }
 
-/// Return the index of the last segment in
-/// the WAL directory.
-fn lastSegmentIdx(io: Io, dir: Io.Dir) !?SegmentIdx {
-    const it = dir.iterate();
-
-    var highest: ?SegmentIdx = null;
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .file) @panic("unexpected entry in WAL directory");
-        const idx = nameToSegmentIdx(entry.name) catch @panic("unexpected file in WAL directory");
-        if (highest) |max| {
-            highest = @max(max, idx);
-        } else {
-            highest = idx;
-        }
-    }
-
-    return highest;
-}
-
 /// Append a WAL entry and return its LSN
 pub fn append(self: *Self, bytes: []const u8) !LSN {
     assert(self.mode == .append);
@@ -343,15 +324,6 @@ inline fn idxToSegmentName(index: LSN) [segment_name_len]u8 {
     assert(ret.len == segment_name_len);
 
     return buf;
-}
-
-fn nameToSegmentIdx(name: []const u8) !LSN {
-    if (!mem.startsWith(u8, name, segment_name_prefix))
-        return error.InvalidName;
-    const digits = name[segment_name_prefix.len..];
-    if (digits.len != segment_name_digits)
-        return error.InvalidName;
-    return std.fmt.parseInt(LSN, digits, 10) catch return error.InvalidName;
 }
 
 test "append and iterate" {
