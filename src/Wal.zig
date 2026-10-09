@@ -90,7 +90,8 @@ pub fn openWithSegmentSize(allocator: mem.Allocator, io: Io, dir: Io.Dir, segmen
                 @panic("new WAL cannot have a checkpoint");
             }
             mode = .append;
-            break :brk try dir.createFile(io, &check_segment_name, .{ .exclusive = true });
+            const file = try createSegment(io, dir, 0);
+            break :brk file;
         },
         else => return e,
     };
@@ -110,7 +111,7 @@ pub fn openWithSegmentSize(allocator: mem.Allocator, io: Io, dir: Io.Dir, segmen
             prev.close(io);
             if (prev_stat.size != segment_size) @panic("checkpoint is beyond WAL");
             mode = .append;
-            break :blk try dir.createFile(io, &idxToSegmentName(lsn / segment_size), .{ .read = true });
+            break :blk try createSegment(io, dir, lsn / segment_size);
         },
         else => return e,
     };
@@ -217,10 +218,16 @@ pub fn append(self: *Self, bytes: []const u8) !LSN {
 /// Create the next segment if we reached the end of the current segment
 fn rotate(self: *Self, idx: SegmentIdx) !void {
     assert(self.pos == self.segment_size);
-    const file_name = idxToSegmentName(idx);
     self.file.close(self.io);
-    self.file = try self.dir.createFile(self.io, &file_name, .{ .read = true });
+    self.file = try createSegment(self.io, self.dir, idx);
     self.pos = 0;
+}
+
+/// Create a new segment file and fsync the parent directory.
+fn createSegment(io: Io, dir: Io.Dir, idx: SegmentIdx) !Io.File {
+    const file = try dir.createFile(io, &idxToSegmentName(idx), .{ .read = true, .exclusive = true });
+    stdx.fsyncDir(io, dir);
+    return file;
 }
 
 const Record = struct {
@@ -301,9 +308,14 @@ pub fn next(self: *@This()) WalRecoveryError!?Record {
         const remaining = self.segment_size - self.pos;
         if (remaining == 0) {
             if (!try self.nextSegment()) @panic("next segment does not exist");
+            continue;
         }
 
         nread = try self.file.readPositional(self.io, cursor.peek(remaining), self.pos);
+
+        // EOF
+        if (nread == 0)
+            return WalRecoveryError.InvalidRecord;
 
         cursor.advance(nread);
         self.pos += nread;
@@ -347,7 +359,7 @@ fn nameToSegmentIdx(name: []const u8) !LSN {
 test "append and iterate" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.open(allocator, io, tmp.dir, null);
@@ -374,7 +386,7 @@ test "append and iterate" {
 test "iter detects corruption of an entry" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.open(allocator, io, tmp.dir, null);
@@ -393,7 +405,7 @@ test "iter detects corruption of an entry" {
 test "iter rejects a length that overflows the log" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.open(allocator, io, tmp.dir, null);
@@ -412,7 +424,7 @@ test "iter rejects a length that overflows the log" {
 test "append a record that crosses a segment boundary" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.openWithSegmentSize(allocator, io, tmp.dir, 64, null);
@@ -450,7 +462,7 @@ test "append a record that crosses a segment boundary" {
 test "recovery continues past a record ending exactly at a segment boundary" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.openWithSegmentSize(allocator, io, tmp.dir, 64, null);
@@ -479,7 +491,7 @@ test "recovery continues past a record ending exactly at a segment boundary" {
 test "append across three segments recovers all records" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.openWithSegmentSize(allocator, io, tmp.dir, 64, null);
@@ -510,4 +522,24 @@ test "append across three segments recovers all records" {
     try std.testing.expectEqualSlices(u8, &three, e3.?.buffer);
 
     try std.testing.expectEqual(null, try wal.next());
+}
+
+test "detect a truncated record" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var wal = try Self.open(allocator, io, tmp.dir, null);
+    _ = try wal.append("inc 5");
+
+    // XXX: truncate file
+    const stat = try wal.file.stat(io);
+    try wal.file.setLength(io, stat.size - 4);
+
+    wal.deinit();
+    wal = try Self.open(allocator, io, tmp.dir, null);
+    defer wal.deinit();
+
+    try std.testing.expectError(WalRecoveryError.InvalidRecord, wal.next());
 }

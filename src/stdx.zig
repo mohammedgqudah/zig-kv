@@ -78,6 +78,16 @@ pub fn pwritev(fd: fd_t, iovec: []const std.posix.iovec_const, offset: usize) Re
     }
 }
 
+pub fn fsyncDir(io: std.Io, dir: std.Io.Dir) void {
+    const dir_file: std.Io.File = .{
+        .handle = dir.handle,
+        .flags = .{ .nonblocking = false },
+    };
+    dir_file.sync(io) catch {
+        @panic("fatal: fsync failure");
+    };
+}
+
 pub fn xxd(io: std.Io, buffer: []const u8) !void {
     if (builtin.mode == .debug and !builtin.is_test) {
         @compileError("can't use xxd in release mode");
