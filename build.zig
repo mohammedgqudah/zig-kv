@@ -75,6 +75,13 @@ pub fn build(b: *std.Build) void {
     lldb_cmd.addArtifactArg(tests);
     lldb_cmd.addPassthruArgs();
     debug_step.dependOn(&lldb_cmd.step);
+
+    // coverage
+    const coverage_step = b.step("coverage", "Run the test artifact under kcov, writing a report to kcov-out");
+    const kcov_cmd = b.addSystemCommand(&.{ "kcov", "--include-pattern=src", "kcov-out" });
+    kcov_cmd.addArtifactArg(tests);
+    kcov_cmd.addPassthruArgs();
+    coverage_step.dependOn(&kcov_cmd.step);
 }
 
 /// Add tests with `options` as its `config` module.
