@@ -32,8 +32,6 @@ pub fn build(b: *std.Build) void {
     });
 
     const options = b.addOptions();
-    options.addOption(bool, "disable_page_cache", false);
-
     exe.root_module.addOptions("config", options);
 
     b.installArtifact(exe);
