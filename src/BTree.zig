@@ -342,6 +342,8 @@ pub fn insert(
     const page = try self.descend(key, &path);
     var target = page;
     defer {
+        // release the leaf page that was modified. If the page was split
+        // then we need to release the original and the new page as well. 
         if (target.page_id != page.page_id) self.page_cache.put(target);
         self.page_cache.put(page);
         path.deinit(self.allocator);
