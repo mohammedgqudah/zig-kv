@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const stdx = @import("stdx.zig");
 
 const mem = std.mem;
@@ -61,7 +62,11 @@ const segment_name_digits = 20;
 const segment_name_len = segment_name_prefix.len + segment_name_digits;
 
 /// 1 GB
-const max_record_size = 1 * 1024 * 1024 * 1024;
+const max_record_size =
+    if (!builtin.is_test)
+        1 * 1024 * 1024 * 1024
+    else
+        500;
 
 comptime {
     assert(default_segment_size % 8 == 0);
@@ -86,7 +91,7 @@ pub fn openWithSegmentSize(io: Io, dir: Io.Dir, segment_size: u64, checkpoint: ?
         error.FileNotFound => brk: {
             // if segment zero does not exist, then this is a new WAL
             if (checkpoint != null) {
-                @panic("new WAL cannot have a checkpoint");
+                return error.UnexpectedMissingWal;
             }
             mode = .append;
             const file = try createSegment(io, dir, 0);
@@ -104,7 +109,7 @@ pub fn openWithSegmentSize(io: Io, dir: Io.Dir, segment_size: u64, checkpoint: ?
             // The checkpoint segment is missing. This is only valid when the
             // checkpoint lands exactly at the end of the WAL: on a segment
             // boundary, with the previous segment full.
-            if (pos != 0) @panic("checkpoint is beyond WAL");
+            if (pos != 0) return error.CheckpointBeyondWal;
             const prev = try openSegment(io, dir, lsn - segment_size, segment_size);
             const prev_stat = try prev.stat(io);
             prev.close(io);
@@ -117,7 +122,7 @@ pub fn openWithSegmentSize(io: Io, dir: Io.Dir, segment_size: u64, checkpoint: ?
 
     const stat = try segment.stat(io);
     if (pos > stat.size)
-        @panic("checkpoint is beyond WAL");
+        return error.CheckpointBeyondWal;
 
     return .{
         .dir = dir,
@@ -512,4 +517,46 @@ test "detect a truncated record" {
     defer wal.deinit();
 
     try std.testing.expectError(WalRecoveryError.InvalidRecord, wal.next(allocator));
+}
+
+test "reject checkpoint if WAL did not exist" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const checkpoint = 5;
+    const err = Self.open(io, tmp.dir, checkpoint);
+    try std.testing.expectError(error.UnexpectedMissingWal, err);
+}
+
+test "reject checkpoint beyond wal" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
+
+    const filler: [64 - @sizeOf(Header)]u8 = @splat(0);
+    _ = try wal.append(&filler);
+
+    wal.deinit();
+
+    var checkpoint: LSN = 64;
+    wal = try Self.openWithSegmentSize(io, tmp.dir, 64, checkpoint);
+    wal.deinit();
+
+    checkpoint = 70;
+    const err = Self.openWithSegmentSize(io, tmp.dir, 64, checkpoint);
+    try std.testing.expectError(error.CheckpointBeyondWal, err);
+}
+
+test "reject records exceeding max size" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var wal = try Self.open(io, tmp.dir, null);
+    const filler: [max_record_size + 1]u8 = @splat(0);
+    const err = wal.append(&filler);
+    try std.testing.expectError(error.RecordTooLarge, err);
 }
