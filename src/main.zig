@@ -7,6 +7,7 @@ const page_tests = @import("page_tests.zig");
 const PageCache = @import("PageCache.zig");
 const BTree = @import("BTree.zig");
 const Session = @import("Session.zig");
+const Wal = @import("Wal.zig");
 
 const mem = std.mem;
 const assert = std.debug.assert;
@@ -40,4 +41,5 @@ test {
     std.testing.refAllDecls(PageCache);
     std.testing.refAllDecls(BTree);
     std.testing.refAllDecls(Session);
+    std.testing.refAllDecls(Wal);
 }
