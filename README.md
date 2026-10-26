@@ -1,11 +1,27 @@
 ## kv
-An on-disk [B+Tree](https://en.wikipedia.org/wiki/B%2B_tree) in zig.
+A key value database, based on a [B+Tree](https://en.wikipedia.org/wiki/B%2B_tree)
 
-## Why
-I’ve always wanted to write a B+ tree from scratch to test my understanding of them.
 
-This is still a work in progress, and I plan to support concurrent operations
-once I finished reading some books.
+# Usage
+```zig
+pub fn main(init: std.process.Init) !void {
+    const db = try Database.open("db", .{
+        .io = init.io,
+        .gpa = init.gpa,
+        .cwd = std.Io.Dir.cwd(),
+    });
+    defer db.deinit();
+
+    var session = Session.open(db, init.gpa);
+    defer session.deinit();
+
+    try session.insert("abc", "123");
+
+    // `find` returns a copy of the value, owned by the caller.
+    const value = try session.find("abc") orelse return error.KeyMissing;
+    defer init.gpa.free(value);
+}
+```
 
 # Disk Layout
 ```
@@ -17,7 +33,7 @@ db
     └── wal-00000000000000000001
 ```
 
-### Plan
-- [ ] WAL
-- [ ] Durability
-- [ ] Fault injection tests with dm
+
+# Plan
+[ ] Concurrency
+[ ] Finish WAL

@@ -21,14 +21,20 @@ checkpoint: Log.LSN,
 checkpoint_file: Io.File,
 log: Log,
 
-/// Open the database at `path`.
-/// A new database is initialized if `path` doesn't exist.
-pub fn open(
+pub const DatabaseOpenOptions = struct {
     io: Io,
     gpa: mem.Allocator,
+    /// The directory `path` is resolved against.
     cwd: Io.Dir,
-    path: []const u8,
-) !*Self {
+};
+
+/// Open the database in the `path` directory.
+/// A new database is initialized if `path` doesn't exist.
+pub fn open(path: []const u8, options: DatabaseOpenOptions) !*Self {
+    const io = options.io;
+    const gpa = options.gpa;
+    const cwd = options.cwd;
+
     const self = try gpa.create(Self);
     errdefer gpa.destroy(self);
 

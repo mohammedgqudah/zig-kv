@@ -41,7 +41,11 @@ test "insert then find a key" {
     var tmp = stdx.tmpMemoryDir(.{});
     defer tmp.cleanup();
 
-    const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+    const db = try Database.open("db", .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .cwd = tmp.dir,
+    });
     defer db.deinit();
 
     var session = Self.open(db, testing.allocator);
@@ -61,7 +65,11 @@ test "keys survive reopening the database" {
     defer tmp.cleanup();
 
     {
-        const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+        const db = try Database.open("db", .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .cwd = tmp.dir,
+        });
         defer db.deinit();
 
         var session = Self.open(db, testing.allocator);
@@ -70,7 +78,11 @@ test "keys survive reopening the database" {
         try session.insert("hello", "world");
     }
 
-    const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+    const db = try Database.open("db", .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .cwd = tmp.dir,
+    });
     defer db.deinit();
 
     var session = Self.open(db, testing.allocator);
@@ -87,7 +99,7 @@ test "keys survive reopening the database" {
 //    defer tmp.cleanup();
 //
 //    {
-//        const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+//        const db = try Database.open("db", .{ .io = testing.io, .gpa = testing.allocator, .cwd = tmp.dir, });
 //
 //        var session = Self.open(db, testing.allocator);
 //        try session.insert("abc", "123");
@@ -106,7 +118,7 @@ test "keys survive reopening the database" {
 //        try index_file.writePositionalAll(testing.io, @ptrCast(&fill), 0);
 //    }
 //
-//    const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+//    const db = try Database.open("db", .{ .io = testing.io, .gpa = testing.allocator, .cwd = tmp.dir, });
 //    defer db.deinit();
 //
 //    var session = Self.open(db, testing.allocator);
@@ -131,7 +143,11 @@ test "reopening a database that spans multiple pages" {
 
     // Enough rows to split the root page and allocate new pages.
     {
-        const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+        const db = try Database.open("db", .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .cwd = tmp.dir,
+        });
         defer db.deinit();
 
         var session = Self.open(db, testing.allocator);
@@ -143,7 +159,11 @@ test "reopening a database that spans multiple pages" {
         }
     }
 
-    const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+    const db = try Database.open("db", .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .cwd = tmp.dir,
+    });
     defer db.deinit();
 
     var session = Self.open(db, testing.allocator);

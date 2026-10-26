@@ -23,7 +23,11 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const cwd = std.Io.Dir.cwd();
 
-    const db = try Database.open(init.io, gpa, cwd, "db.z");
+    const db = try Database.open("db.z", .{
+        .io = init.io,
+        .gpa = gpa,
+        .cwd = cwd,
+    });
     defer db.deinit();
 
     var session = Session.open(db, gpa);
