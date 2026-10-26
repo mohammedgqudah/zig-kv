@@ -10,7 +10,7 @@ const Log = @import("Log.zig");
 const PageId = pagemod.PageId;
 const CellOffset = pagemod.CellOffset;
 const PageHeader = pagemod.PageHeader;
-const PageBuffer = pagemod.PageBuffer;
+const PageFrame = pagemod.PageFrame;
 const Cell = pagemod.Cell;
 const page_size = pagemod.page_size;
 const page_magic = pagemod.page_magic;
@@ -26,7 +26,7 @@ const test_allocator = std.testing.allocator;
 fn writeMetaPage(io: Io, file: Io.File, next_free_page_id: PageId) !void {
     var buf: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
     @memset(&buf, 0);
-    var page: PageBuffer = .new(&buf, 0);
+    var page: PageFrame = .new(&buf, 0);
     page.meta().* = .{
         .root_page_id = 1,
         .next_free_page_id = next_free_page_id,
@@ -73,7 +73,7 @@ pub fn expectValidTreeNode(
     tree: *Tree,
     page_id: PageId,
 ) !validPageResult {
-    var page: *PageBuffer = try tree.page_cache.get(page_id);
+    var page: *PageFrame = try tree.page_cache.get(page_id);
     defer tree.page_cache.put(page);
 
     // 1. root.pointers() is sorted
@@ -169,7 +169,7 @@ test "it finds keys in a leaf root node" {
     var buf: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
     var test_cell: [48]u8 = undefined;
 
-    var root: PageBuffer = .new(&buf, 1);
+    var root: PageFrame = .new(&buf, 1);
     root.header().* = .empty(.leaf);
     for ("ABC") |fill| {
         @memset(&test_cell, fill);
@@ -220,7 +220,7 @@ test "insert then find reloaded tree" {
 
     var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
 
-    var root: PageBuffer = .new(&storage, 1);
+    var root: PageFrame = .new(&storage, 1);
     root.header().* = .empty(.leaf);
     try file.writePositionalAll(io, &storage, 1 * page_size);
     try writeMetaPage(io, file, 2);
@@ -384,7 +384,7 @@ test "some tree" {
     var temp_page_id: PageId = 2;
     var cell: Cell = .raw(&test_cell);
     cell.from_keyval("7", @ptrCast(&temp_page_id));
-    var page: PageBuffer = .new(&buf, 1);
+    var page: PageFrame = .new(&buf, 1);
     page.header().* = .empty(.internal);
     page.header().right_pointer = 3;
     page.append_cell(&test_cell);

@@ -5,7 +5,7 @@ const PageCache = @import("PageCache.zig");
 const Log = @import("Log.zig");
 const Cell = pagemod.Cell;
 const CellOffset = pagemod.CellOffset;
-const PageBuffer = pagemod.PageBuffer;
+const PageFrame = pagemod.PageFrame;
 const PageHeader = pagemod.PageHeader;
 const PageId = pagemod.PageId;
 const page_size = pagemod.page_size;
@@ -26,7 +26,7 @@ const Self = @This();
 pub const FindResult = struct {
     /// The lifetime of the cell is tied to the page buffer
     cell: ?Cell,
-    page: *PageBuffer,
+    page: *PageFrame,
 };
 
 root_page_id: u64,
@@ -78,7 +78,7 @@ pub fn load(allocator: mem.Allocator, page_cache: *PageCache, log: *Log) Self {
 /// Index of the first pointer whose key is greater than `key`.
 ///
 /// If `key` is greater than all keys, then pointers.len is returned.
-fn upperBound(page: *PageBuffer, key: []const u8) usize {
+fn upperBound(page: *PageFrame, key: []const u8) usize {
     var low: usize = 0;
     var high: usize = page.pointers().len;
     while (low < high) {
@@ -96,7 +96,7 @@ fn upperBound(page: *PageBuffer, key: []const u8) usize {
 const Path = std.ArrayList(PageId);
 
 /// Return the child (page_id) a cell is pointing to.
-fn childAt(page: *PageBuffer, index: usize) PageId {
+fn childAt(page: *PageFrame, index: usize) PageId {
     std.debug.assert(page.header().type == .internal);
     if (index == page.pointers().len) return page.header().right_pointer;
     var cell = page.cell(page.pointers()[index]);
@@ -104,7 +104,7 @@ fn childAt(page: *PageBuffer, index: usize) PageId {
 }
 
 /// Descend the tree until a leaf that might hold `key` is found.
-fn descend(self: *Self, key: []const u8, path: ?*Path) Error!*PageBuffer {
+fn descend(self: *Self, key: []const u8, path: ?*Path) Error!*PageFrame {
     var page_id = self.root_page_id;
     while (true) {
         const page = try self.page_cache.get(page_id);
@@ -116,7 +116,7 @@ fn descend(self: *Self, key: []const u8, path: ?*Path) Error!*PageBuffer {
     }
 }
 
-fn lookupCell(leaf: *PageBuffer, key: []const u8, upper_bound_idx: usize) ?Cell {
+fn lookupCell(leaf: *PageFrame, key: []const u8, upper_bound_idx: usize) ?Cell {
     if (upper_bound_idx == 0) return null;
     var cell = leaf.cell(leaf.pointers()[upper_bound_idx - 1]);
     return if (mem.eql(u8, key, cell.key())) cell else null;
@@ -185,7 +185,7 @@ fn insert_separator(
 ///
 /// left: [1, 3, 4]
 /// right: [5, 6, 7]
-pub fn __split_page(self: *Self, page: *PageBuffer, out_separator_key: []u8) !*PageBuffer {
+pub fn __split_page(self: *Self, page: *PageFrame, out_separator_key: []u8) !*PageFrame {
     const new_page_id = try self.page_cache.allocate();
     const new_page = try self.page_cache.get(new_page_id);
     new_page.header().* = .empty(page.header().type);
@@ -238,7 +238,7 @@ pub fn __split_page(self: *Self, page: *PageBuffer, out_separator_key: []u8) !*P
 
 const SplitPageResult = struct {
     /// The page to insert the new key after splitting
-    target_page: *PageBuffer,
+    target_page: *PageFrame,
     insert_idx: usize,
 };
 
@@ -251,13 +251,13 @@ const SplitPageResult = struct {
 ///
 pub fn split_page(
     self: *Self,
-    page: *PageBuffer,
+    page: *PageFrame,
     path: *Path,
     upper_bound: usize,
     key: []const u8,
 ) !SplitPageResult {
     var insert_idx = upper_bound;
-    var target_page: *PageBuffer = page;
+    var target_page: *PageFrame = page;
 
     var separator_key_buf: [page_size]u8 = undefined;
 
@@ -336,7 +336,7 @@ inline fn cellSize(key: []const u8, value: []const u8) usize {
 }
 
 /// Shift pointers to the right, and then write a cell at `idx`.
-fn writeCell(page: *PageBuffer, idx: usize, key: []const u8, value: []const u8) void {
+fn writeCell(page: *PageFrame, idx: usize, key: []const u8, value: []const u8) void {
     const pointers = page.pointers();
     if (idx < pointers.len)
         @memmove(pointers.ptr[idx + 1 .. pointers.len + 1], pointers[idx..]);
@@ -351,7 +351,7 @@ fn writeCell(page: *PageBuffer, idx: usize, key: []const u8, value: []const u8) 
 }
 
 /// Check if the page has room to insert a cell and its pointer (offset)
-fn hasRoom(page: *PageBuffer, key: []const u8, value: []const u8) bool {
+fn hasRoom(page: *PageFrame, key: []const u8, value: []const u8) bool {
     const needed_size = cellSize(key, value) + @sizeOf(CellOffset);
     return page.header().freeSpace() >= needed_size;
 }

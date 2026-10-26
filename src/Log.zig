@@ -9,7 +9,7 @@ const Io = std.Io;
 const mem = std.mem;
 
 pub const LSN = Wal.LSN;
-const PageBuffer = pagemod.PageBuffer;
+const PageFrame = pagemod.PageFrame;
 const PageId = pagemod.PageId;
 const page_size = pagemod.page_size;
 
@@ -88,7 +88,7 @@ pub fn recover_full_page(self: *Log, raw_buf: []u8) !void {
 /// the page will be recorded.
 ///
 /// format: [tag][key_len][value_len][key][value]
-pub fn log_insert(self: *Log, allocator: mem.Allocator, key: []const u8, value: []const u8, page: *PageBuffer) !LSN {
+pub fn log_insert(self: *Log, allocator: mem.Allocator, key: []const u8, value: []const u8, page: *PageFrame) !LSN {
     // no-op during recover inserts, see `recover_insert`
     // TODO: not sure if the caller (the tree) is responsible for that
     if (self.wal.mode == .recovery) return 0;
@@ -121,7 +121,7 @@ pub fn log_insert(self: *Log, allocator: mem.Allocator, key: []const u8, value: 
 /// log a copy of the page
 ///
 /// format: [tag][page_id][page]
-pub fn log_page(self: *Log, allocator: mem.Allocator, page: *const PageBuffer) !LSN {
+pub fn log_page(self: *Log, allocator: mem.Allocator, page: *const PageFrame) !LSN {
     const buf = try allocator.alloc(u8, @sizeOf(Tag) + @sizeOf(PageId) + page_size);
     defer allocator.free(buf);
 

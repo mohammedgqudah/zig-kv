@@ -5,7 +5,7 @@ const pagemod = @import("page.zig");
 const Io = std.Io;
 const mem = std.mem;
 const PageId = pagemod.PageId;
-const PageBuffer = pagemod.PageBuffer;
+const PageFrame = pagemod.PageFrame;
 const PageHeader = pagemod.PageHeader;
 const page_size = pagemod.page_size;
 
@@ -14,7 +14,7 @@ const page_size = pagemod.page_size;
 /// Just like the rest of the code, this is not thread-safe, yet.
 const Self = @This();
 
-cache: std.AutoHashMap(PageId, *PageBuffer),
+cache: std.AutoHashMap(PageId, *PageFrame),
 allocator: mem.Allocator,
 file: Io.File,
 io: Io,
@@ -31,15 +31,13 @@ pub fn new(allocator: mem.Allocator, file: Io.File, io: Io) Self {
     };
 }
 
-fn load_page(self: *Self, id: PageId) !*PageBuffer {
-    // TODO: should page buf be a fixed array inside PageBuffer?
-    //       it would allow us to do a single allocation.
+fn load_page(self: *Self, id: PageId) !*PageFrame {
     const page_buf = try self.allocator.alignedAlloc(
         u8,
         .of(PageHeader),
         page_size,
     );
-    const page = try self.allocator.create(PageBuffer);
+    const page = try self.allocator.create(PageFrame);
     errdefer {
         self.allocator.free(page_buf);
         self.allocator.destroy(page);
@@ -56,12 +54,12 @@ fn load_page(self: *Self, id: PageId) !*PageBuffer {
     return page;
 }
 
-pub fn mark_page_dirty(self: *Self, page: *PageBuffer) void {
+pub fn mark_page_dirty(self: *Self, page: *PageFrame) void {
     _ = self;
     page.is_dirty = true;
 }
 
-inline fn writeback_page(self: *Self, page: *PageBuffer) void {
+inline fn writeback_page(self: *Self, page: *PageFrame) void {
     self.file.writePositionalAll(self.io, page.inner, page.page_id * page_size) catch {
         @panic("writeback failed");
     };
@@ -92,7 +90,7 @@ pub fn allocate(self: *Self) !PageId {
 /// defer page_cache.put(page);
 /// // modify the page
 /// ```
-pub fn get(self: *Self, id: PageId) !*PageBuffer {
+pub fn get(self: *Self, id: PageId) !*PageFrame {
     const result = try self.cache.getOrPut(id);
 
     if (!result.found_existing) {
@@ -104,7 +102,7 @@ pub fn get(self: *Self, id: PageId) !*PageBuffer {
     return result.value_ptr.*;
 }
 
-pub fn put(self: *Self, page: *PageBuffer) void {
+pub fn put(self: *Self, page: *PageFrame) void {
     const old_refcnt = page.refcnt.fetchSub(1, .monotonic);
     if (old_refcnt == 1) {
         self.writeback_page(page);

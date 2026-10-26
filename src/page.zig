@@ -146,8 +146,11 @@ pub const Cell = struct {
 /// Raw bytes for a page.
 pub const PageBytes = []align(@alignOf(PageHeader)) u8;
 
-/// A wrapper around the page bytes
-pub const PageBuffer = struct {
+/// A slot that holds a page in memory.
+///
+/// - use `header()` to interpret data as a BTree node.
+/// - use `meta()` to interpret data as the tree meta page.
+pub const PageFrame = struct {
     const Self = @This();
     inner: PageBytes,
     // This should not be accessed directly, only by the page cache.
@@ -171,6 +174,7 @@ pub const PageBuffer = struct {
     }
 
     pub inline fn meta(self: *Self) *MetaPage {
+        assert(self.page_id == 0);
         return @ptrCast(@alignCast(self.inner.ptr));
     }
 
@@ -215,7 +219,7 @@ pub const PageBuffer = struct {
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
         try writer.print(
-            "PageBuffer{{ page={}, ref_count={}, dirty={} }} @ {*}\n",
+            "PageFrame{{ page={}, ref_count={}, dirty={} }} @ {*}\n",
             .{
                 self.page_id,
                 self.refcnt.load(.monotonic),
