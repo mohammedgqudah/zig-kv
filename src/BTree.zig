@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const pagemod = @import("page.zig");
-const PageCache = @import("PageCache.zig");
+const BufferManager = @import("BufferManager.zig");
 const Log = @import("Log.zig");
 const Cell = pagemod.Cell;
 const CellOffset = pagemod.CellOffset;
@@ -30,45 +30,45 @@ pub const FindResult = struct {
 };
 
 root_page_id: u64,
-page_cache: *PageCache,
+buffer_manager: *BufferManager,
 log: *Log,
 allocator: mem.Allocator,
 
 /// initialize a new tree on top of an empty database file.
-pub fn empty(allocator: mem.Allocator, page_cache: *PageCache, log: *Log) !Self {
+pub fn empty(allocator: mem.Allocator, buffer_manager: *BufferManager, log: *Log) !Self {
     var tree: Self = .{
-        .page_cache = page_cache,
+        .buffer_manager = buffer_manager,
         .log = log,
         .allocator = allocator,
         .root_page_id = 1,
     };
-    const root_id = try tree.page_cache.allocate();
+    const root_id = try tree.buffer_manager.allocate();
     tree.root_page_id = root_id;
 
-    var root_page = try tree.page_cache.get(root_id);
-    defer tree.page_cache.put(root_page);
+    var root_page = try tree.buffer_manager.get(root_id);
+    defer tree.buffer_manager.put(root_page);
 
     root_page.header().* = .empty(.leaf);
-    tree.page_cache.mark_page_dirty(root_page);
+    tree.buffer_manager.mark_page_dirty(root_page);
 
-    const meta_page = try tree.page_cache.get(0);
-    defer tree.page_cache.put(meta_page);
+    const meta_page = try tree.buffer_manager.get(0);
+    defer tree.buffer_manager.put(meta_page);
     meta_page.meta().root_page_id = root_id;
 
     return tree;
 }
 
-pub fn load(allocator: mem.Allocator, page_cache: *PageCache, log: *Log) Self {
-    const meta_page = page_cache.get(0) catch {
+pub fn load(allocator: mem.Allocator, buffer_manager: *BufferManager, log: *Log) Self {
+    const meta_page = buffer_manager.get(0) catch {
         @panic("OOM");
     };
-    defer page_cache.put(meta_page);
+    defer buffer_manager.put(meta_page);
 
     const meta = meta_page.meta();
-    page_cache.free_page_id = meta.next_free_page_id;
+    buffer_manager.free_page_id = meta.next_free_page_id;
 
     return .{
-        .page_cache = page_cache,
+        .buffer_manager = buffer_manager,
         .log = log,
         .allocator = allocator,
         .root_page_id = meta.root_page_id,
@@ -107,12 +107,12 @@ fn childAt(page: *PageFrame, index: usize) PageId {
 fn descend(self: *Self, key: []const u8, path: ?*Path) Error!*PageFrame {
     var page_id = self.root_page_id;
     while (true) {
-        const page = try self.page_cache.get(page_id);
+        const page = try self.buffer_manager.get(page_id);
 
         if (path) |p| try p.append(self.allocator, page_id);
         if (page.header().type == .leaf) return page;
         page_id = childAt(page, upperBound(page, key));
-        self.page_cache.put(page);
+        self.buffer_manager.put(page);
     }
 }
 
@@ -143,12 +143,12 @@ fn insert_separator(
 ) Error!void {
     const _value = old_page_id;
     const value: []const u8 = @ptrCast(&_value);
-    const page = try self.page_cache.get(parent_page_id);
+    const page = try self.buffer_manager.get(parent_page_id);
     var target = page;
     defer {
         if (target.page_id != page.page_id)
-            self.page_cache.put(target);
-        self.page_cache.put(page);
+            self.buffer_manager.put(target);
+        self.buffer_manager.put(page);
     }
 
     var insert_idx = upperBound(page, key);
@@ -168,7 +168,7 @@ fn insert_separator(
         var after_cell = target.cell(target.offset(insert_idx + 1));
         mem.writeInt(PageId, @ptrCast(after_cell.val()), new_page_id, .little);
     }
-    self.page_cache.mark_page_dirty(target);
+    self.buffer_manager.mark_page_dirty(target);
 }
 
 /// Only split `page` into two pages, without promoting a key
@@ -186,8 +186,8 @@ fn insert_separator(
 /// left: [1, 3, 4]
 /// right: [5, 6, 7]
 pub fn __split_page(self: *Self, page: *PageFrame, out_separator_key: []u8) !*PageFrame {
-    const new_page_id = try self.page_cache.allocate();
-    const new_page = try self.page_cache.get(new_page_id);
+    const new_page_id = try self.buffer_manager.allocate();
+    const new_page = try self.buffer_manager.get(new_page_id);
     new_page.header().* = .empty(page.header().type);
     new_page.header().right_pointer = page.header().right_pointer;
     const split_index = page.pointers().len / 2;
@@ -299,14 +299,14 @@ pub fn split_page(
     _ = path.pop(); // old leaf id
     const parent_id = parent_id: {
         if (path.items.len != 0) break :parent_id path.items[path.items.len - 1];
-        const new_root_id = try self.page_cache.allocate();
-        var new_root = try self.page_cache.get(new_root_id);
-        defer self.page_cache.put(new_root);
+        const new_root_id = try self.buffer_manager.allocate();
+        var new_root = try self.buffer_manager.get(new_root_id);
+        defer self.buffer_manager.put(new_root);
         new_root.header().* = .empty(.internal);
         self.root_page_id = new_root.page_id;
 
-        const meta_page = try self.page_cache.get(0);
-        defer self.page_cache.put(meta_page);
+        const meta_page = try self.buffer_manager.get(0);
+        defer self.buffer_manager.put(meta_page);
         meta_page.meta().root_page_id = new_root.page_id;
 
 
@@ -322,7 +322,7 @@ pub fn split_page(
     // release the new_page buffer because "key" will be inserted
     // in the left half (old page).
     if (target_page.page_id != new_page.page_id) {
-        self.page_cache.put(new_page);
+        self.buffer_manager.put(new_page);
     }
 
     return .{
@@ -376,8 +376,8 @@ pub fn insert(
     defer {
         // release the leaf page that was modified. If the page was split
         // then we need to release the original and the new page as well.
-        if (target.page_id != page.page_id) self.page_cache.put(target);
-        self.page_cache.put(page);
+        if (target.page_id != page.page_id) self.buffer_manager.put(target);
+        self.buffer_manager.put(page);
         path.deinit(self.allocator);
     }
 
@@ -408,5 +408,5 @@ pub fn insert(
         writeCell(target, insert_idx, key, value);
     }
 
-    self.page_cache.mark_page_dirty(target);
+    self.buffer_manager.mark_page_dirty(target);
 }

@@ -3,7 +3,7 @@ const std = @import("std");
 const Wal = @import("Wal.zig");
 const pagemod = @import("page.zig");
 const BTree = @import("BTree.zig");
-const PageCache = @import("PageCache.zig");
+const BufferManager = @import("BufferManager.zig");
 
 const Io = std.Io;
 const mem = std.mem;
@@ -21,7 +21,7 @@ wal: Wal,
 tree: *BTree,
 /// The WAL checkpoint. Borrowed from `Database`.
 checkpoint: *const LSN,
-page_cache: *PageCache,
+buffer_manager: *BufferManager,
 
 pub const Tag = enum(u64) {
     full_page,
@@ -29,13 +29,13 @@ pub const Tag = enum(u64) {
 };
 
 /// Open an existing WAL or create a new one.
-pub fn open(io: Io, dir: Io.Dir, checkpoint: *const LSN, page_cache: *PageCache) !Log {
+pub fn open(io: Io, dir: Io.Dir, checkpoint: *const LSN, buffer_manager: *BufferManager) !Log {
     return .{
         .wal = try Wal.open(io, dir, if (checkpoint.* == 0) null else checkpoint.*),
         .checkpoint = checkpoint,
         // trust caller to set `tree`
         .tree = undefined,
-        .page_cache = page_cache,
+        .buffer_manager = buffer_manager,
     };
 }
 
@@ -76,8 +76,8 @@ pub fn recover_full_page(self: *Log, raw_buf: []u8) !void {
     const logged_page = raw_buf[8..];
     // TODO: if it fails with IncompletePage then we should still write the page and not fail
     // because it's the job of the WAL to recover it.
-    const page_frame = try self.page_cache.get(page_id);
-    defer self.page_cache.put(page_frame);
+    const page_frame = try self.buffer_manager.get(page_id);
+    defer self.buffer_manager.put(page_frame);
 
     @memcpy(page_frame.inner, logged_page);
 }

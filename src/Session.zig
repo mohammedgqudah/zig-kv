@@ -29,7 +29,7 @@ pub fn insert(self: *Self, key: []const u8, value: []const u8) !void {
 /// The caller owns the returned slice.
 pub fn find(self: *Self, key: []const u8) !?[]u8 {
     const result = try self.db.tree.find(key);
-    defer self.db.page_cache.put(result.page);
+    defer self.db.buffer_manager.put(result.page);
 
     var cell = result.cell orelse return null;
     return try self.gpa.dupe(u8, cell.val());
@@ -113,7 +113,7 @@ test "keys survive reopening the database" {
 //    defer session.deinit();
 //
 //    const result = try session.db.tree.find("abc");
-//    defer session.db.page_cache.put(result.page);
+//    defer session.db.buffer_manager.put(result.page);
 //
 //    var cell = result.cell orelse return error.KeyMissing;
 //    try testing.expectEqualStrings("123", cell.val());

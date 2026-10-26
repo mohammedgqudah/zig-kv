@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
 const config = @import("config");
-const PageCache = @import("PageCache.zig");
+const BufferManager = @import("BufferManager.zig");
 const Log = @import("Log.zig");
 
 const Io = std.Io;

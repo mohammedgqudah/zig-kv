@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const BTree = @import("BTree.zig");
-const PageCache = @import("PageCache.zig");
+const BufferManager = @import("BufferManager.zig");
 const Log = @import("Log.zig");
 
 const Io = std.Io;
@@ -15,7 +15,7 @@ const Self = @This();
 io: Io,
 gpa: mem.Allocator,
 db_file: Io.File,
-page_cache: PageCache,
+buffer_manager: BufferManager,
 tree: BTree,
 checkpoint: Log.LSN,
 checkpoint_file: Io.File,
@@ -67,26 +67,26 @@ pub fn open(
         .io = io,
         .gpa = gpa,
         .db_file = db_file,
-        .page_cache = PageCache.new(gpa, db_file, io),
+        .buffer_manager = BufferManager.new(gpa, db_file, io),
         .tree = undefined,
         .checkpoint = checkpoint,
         .checkpoint_file = checkpoint_file,
         .log = undefined,
     };
-    errdefer self.page_cache.deinit();
+    errdefer self.buffer_manager.deinit();
 
     const wal_dir = if (initialize)
         try data_dir.createDirPathOpen(io, "wal", .{ .open_options = .{ .iterate = true } })
     else
         try data_dir.openDir(io, "wal", .{ .iterate = true });
 
-    self.log = try .open(io, wal_dir, &self.checkpoint, &self.page_cache);
+    self.log = try .open(io, wal_dir, &self.checkpoint, &self.buffer_manager);
     errdefer self.log.deinit();
 
     self.tree = if (initialize)
-        try BTree.empty(gpa, &self.page_cache, &self.log)
+        try BTree.empty(gpa, &self.buffer_manager, &self.log)
     else
-        BTree.load(gpa, &self.page_cache, &self.log);
+        BTree.load(gpa, &self.buffer_manager, &self.log);
 
     self.log.tree = &self.tree;
     //_ = try self.log.recover(gpa);
@@ -96,7 +96,7 @@ pub fn open(
 
 pub fn deinit(self: *Self) void {
     self.log.deinit();
-    self.page_cache.deinit();
+    self.buffer_manager.deinit();
     self.db_file.close(self.io);
     self.gpa.destroy(self);
 }

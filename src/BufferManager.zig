@@ -9,7 +9,7 @@ const PageFrame = pagemod.PageFrame;
 const PageHeader = pagemod.PageHeader;
 const page_size = pagemod.page_size;
 
-/// A hashmap based page cache.
+/// A hashmap based buffer manager.
 ///
 /// Just like the rest of the code, this is not thread-safe, yet.
 const Self = @This();
@@ -86,8 +86,8 @@ pub fn allocate(self: *Self) !PageId {
 /// # Example
 ///
 /// ```zig
-/// const page = try page_cache.get(page_id);
-/// defer page_cache.put(page);
+/// const page = try buffer_manager.get(page_id);
+/// defer buffer_manager.put(page);
 /// // modify the page
 /// ```
 pub fn get(self: *Self, id: PageId) !*PageFrame {

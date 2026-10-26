@@ -4,7 +4,7 @@ const stdx = @import("stdx.zig");
 const devmapper = @import("devicemapper.zig");
 const page = @import("page.zig");
 const page_tests = @import("page_tests.zig");
-const PageCache = @import("PageCache.zig");
+const BufferManager = @import("BufferManager.zig");
 const BTree = @import("BTree.zig");
 const Database = @import("Database.zig");
 const Session = @import("Session.zig");
@@ -42,7 +42,7 @@ test {
     std.testing.refAllDecls(stdx);
     std.testing.refAllDecls(page);
     std.testing.refAllDecls(page_tests);
-    std.testing.refAllDecls(PageCache);
+    std.testing.refAllDecls(BufferManager);
     std.testing.refAllDecls(BTree);
     std.testing.refAllDecls(Database);
     std.testing.refAllDecls(Session);

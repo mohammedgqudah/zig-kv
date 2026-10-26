@@ -4,7 +4,7 @@ const testing = std.testing;
 
 const stdx = @import("stdx.zig");
 const pagemod = @import("page.zig");
-const PageCache = @import("PageCache.zig");
+const BufferManager = @import("BufferManager.zig");
 const Tree = @import("BTree.zig");
 const Log = @import("Log.zig");
 const PageId = pagemod.PageId;
@@ -35,12 +35,12 @@ fn writeMetaPage(io: Io, file: Io.File, next_free_page_id: PageId) !void {
 }
 
 /// A throwaway WAL for tree tests.
-fn openTestLog(io: Io, dir: Io.Dir, checkpoint: *const Log.LSN, page_cache: *PageCache) !Log {
+fn openTestLog(io: Io, dir: Io.Dir, checkpoint: *const Log.LSN, buffer_manager: *BufferManager) !Log {
     const wal_dir = try dir.createDirPathOpen(io, "wal", .{ .open_options = .{ .iterate = true } });
-    return try Log.open(io, wal_dir, checkpoint, page_cache);
+    return try Log.open(io, wal_dir, checkpoint, buffer_manager);
 }
 
-test PageCache {
+test BufferManager {
     const io = std.testing.io;
     const allocator = test_allocator;
 
@@ -48,7 +48,7 @@ test PageCache {
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "file", .{ .read = true });
 
-    var cache: PageCache = .new(allocator, file, io);
+    var cache: BufferManager = .new(allocator, file, io);
     defer cache.deinit();
     assert(cache.get(0) == error.IncompletePage);
 }
@@ -73,8 +73,8 @@ pub fn expectValidTreeNode(
     tree: *Tree,
     page_id: PageId,
 ) !validPageResult {
-    var page: *PageFrame = try tree.page_cache.get(page_id);
-    defer tree.page_cache.put(page);
+    var page: *PageFrame = try tree.buffer_manager.get(page_id);
+    defer tree.buffer_manager.put(page);
 
     // 1. root.pointers() is sorted
     // 2. max_key(child[N]) < key[N]
@@ -184,7 +184,7 @@ test "it finds keys in a leaf root node" {
     try file.writePositionalAll(io, &buf, 1 * page_size);
     try writeMetaPage(io, file, 2);
 
-    var cache: PageCache = .new(allocator, file, io);
+    var cache: BufferManager = .new(allocator, file, io);
     defer cache.deinit();
 
     var checkpoint: Log.LSN = 0;
@@ -196,18 +196,18 @@ test "it finds keys in a leaf root node" {
 
     var result = try tree.find("KA");
     try std.testing.expectEqualStrings("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("KB");
     try std.testing.expectEqualStrings("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("KC");
     try std.testing.expectEqualStrings("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("blah");
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
     try std.testing.expect(result.cell == null);
 }
 
@@ -225,7 +225,7 @@ test "insert then find reloaded tree" {
     try file.writePositionalAll(io, &storage, 1 * page_size);
     try writeMetaPage(io, file, 2);
 
-    var cache: PageCache = .new(allocator, file, io);
+    var cache: BufferManager = .new(allocator, file, io);
     defer cache.deinit();
 
     var checkpoint: Log.LSN = 0;
@@ -242,19 +242,19 @@ test "insert then find reloaded tree" {
     var result = try tree.find("1");
     try std.testing.expectEqualStrings("one", result.cell.?.val());
     try std.testing.expect(result.page.header().lsn != 0);
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("2");
     try std.testing.expectEqualStrings("two", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("3");
     try std.testing.expectEqualStrings("three", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("5");
     try testing.expect(result.cell == null);
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     try expectValidTree(&tree);
 }
@@ -276,7 +276,7 @@ test "insert random keys" {
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
-    var cache: PageCache = .new(allocator, file, io);
+    var cache: BufferManager = .new(allocator, file, io);
     defer cache.deinit();
 
     var checkpoint: Log.LSN = 0;
@@ -305,7 +305,7 @@ test "insert random keys" {
     var it = values.iterator();
     while (it.next()) |entry| {
         const res = try tree.find(entry.key_ptr.*);
-        defer tree.page_cache.put(res.page);
+        defer tree.buffer_manager.put(res.page);
 
         var cell = res.cell orelse return error.KeyMissing;
         try std.testing.expectEqualSlices(u8, entry.key_ptr.*, cell.key());
@@ -325,7 +325,7 @@ test "test propgating splits" {
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
-    var cache: PageCache = .new(allocator, file, io);
+    var cache: BufferManager = .new(allocator, file, io);
     defer cache.deinit();
 
     var checkpoint: Log.LSN = 0;
@@ -355,7 +355,7 @@ test "test propgating splits" {
     var it = values.iterator();
     while (it.next()) |entry| {
         const res = try tree.find(entry.key_ptr.*);
-        defer tree.page_cache.put(res.page);
+        defer tree.buffer_manager.put(res.page);
 
         var cell = res.cell orelse return error.KeyMissing;
         try std.testing.expectEqualSlices(u8, entry.key_ptr.*, cell.key());
@@ -509,7 +509,7 @@ test "some tree" {
     try file.writePositionalAll(io, &buf, 8 * page_size);
     try writeMetaPage(io, file, 9);
 
-    var cache: PageCache = .new(allocator, file, io);
+    var cache: BufferManager = .new(allocator, file, io);
     defer cache.deinit();
 
     var checkpoint: Log.LSN = 0;
@@ -523,35 +523,35 @@ test "some tree" {
 
     var result = try tree.find("1");
     try std.testing.expectEqualStrings("one", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("2");
     try std.testing.expectEqualStrings("two", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("3");
     try std.testing.expectEqualStrings("three", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("4");
     try std.testing.expectEqualStrings("four", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("5");
     try std.testing.expectEqualStrings("five", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("6");
     try std.testing.expectEqualStrings("six", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("7");
     try std.testing.expectEqualStrings("seven", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
 
     result = try tree.find("8");
     try std.testing.expectEqualStrings("eight", result.cell.?.val());
-    tree.page_cache.put(result.page);
+    tree.buffer_manager.put(result.page);
     // fails because 10 is less than 9 lexically, i should use alphabet or stop at 9
     //try std.testing.expectEqualStrings("nine", (try tree.find("9", &storage)).?);
 }
@@ -565,7 +565,7 @@ test "insert keys in ascending order" {
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
-    var cache: PageCache = .new(allocator, file, io);
+    var cache: BufferManager = .new(allocator, file, io);
     defer cache.deinit();
 
     var checkpoint: Log.LSN = 0;
@@ -594,7 +594,7 @@ test "insert keys in descending order" {
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
-    var cache: PageCache = .new(allocator, file, io);
+    var cache: BufferManager = .new(allocator, file, io);
     defer cache.deinit();
 
     var checkpoint: Log.LSN = 0;
