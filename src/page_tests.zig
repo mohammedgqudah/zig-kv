@@ -73,7 +73,7 @@ pub fn expectValidTreeNode(
     tree: *Tree,
     page_id: PageId,
 ) !validPageResult {
-    var page: *PageBuffer = (try tree.page_cache.get(page_id)).?;
+    var page: *PageBuffer = try tree.page_cache.get(page_id);
     defer tree.page_cache.put(page);
 
     // 1. root.pointers() is sorted

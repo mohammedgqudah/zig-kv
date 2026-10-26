@@ -77,8 +77,8 @@ pub fn allocate(self: *Self) !PageId {
     self.free_page_id += 1;
 
     const meta_page = try self.get(0);
-    defer self.put(meta_page.?);
-    meta_page.?.meta().next_free_page_id = self.free_page_id;
+    defer self.put(meta_page);
+    meta_page.meta().next_free_page_id = self.free_page_id;
 
     return id;
 }
@@ -88,13 +88,11 @@ pub fn allocate(self: *Self) !PageId {
 /// # Example
 ///
 /// ```zig
-/// const result = try page_cache.get(page_id);
-/// const page = result orelse return null;
+/// const page = try page_cache.get(page_id);
 /// defer page_cache.put(page);
 /// // modify the page
 /// ```
-/// TODO: return cannot be null, change type.
-pub fn get(self: *Self, id: PageId) !?*PageBuffer {
+pub fn get(self: *Self, id: PageId) !*PageBuffer {
     const result = try self.cache.getOrPut(id);
 
     if (!result.found_existing) {

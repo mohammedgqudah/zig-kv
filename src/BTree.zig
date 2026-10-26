@@ -45,13 +45,13 @@ pub fn empty(allocator: mem.Allocator, page_cache: *PageCache, log: *Log) !Self 
     const root_id = try tree.page_cache.allocate();
     tree.root_page_id = root_id;
 
-    var root_page = (try tree.page_cache.get(root_id)).?;
+    var root_page = try tree.page_cache.get(root_id);
     defer tree.page_cache.put(root_page);
 
     root_page.header().* = .empty(.leaf);
     tree.page_cache.mark_page_dirty(root_page);
 
-    const meta_page = (try tree.page_cache.get(0)).?;
+    const meta_page = try tree.page_cache.get(0);
     defer tree.page_cache.put(meta_page);
     meta_page.meta().root_page_id = root_id;
 
@@ -61,7 +61,7 @@ pub fn empty(allocator: mem.Allocator, page_cache: *PageCache, log: *Log) !Self 
 pub fn load(allocator: mem.Allocator, page_cache: *PageCache, log: *Log) Self {
     const meta_page = page_cache.get(0) catch {
         @panic("OOM");
-    } orelse unreachable;
+    };
     defer page_cache.put(meta_page);
 
     const meta = meta_page.meta();
@@ -107,7 +107,7 @@ fn childAt(page: *PageBuffer, index: usize) PageId {
 fn descend(self: *Self, key: []const u8, path: ?*Path) Error!*PageBuffer {
     var page_id = self.root_page_id;
     while (true) {
-        const page = (try self.page_cache.get(page_id)).?;
+        const page = try self.page_cache.get(page_id);
 
         if (path) |p| try p.append(self.allocator, page_id);
         if (page.header().type == .leaf) return page;
@@ -143,7 +143,7 @@ fn insert_separator(
 ) Error!void {
     const _value = old_page_id;
     const value: []const u8 = @ptrCast(&_value);
-    const page = (try self.page_cache.get(parent_page_id)).?;
+    const page = try self.page_cache.get(parent_page_id);
     var target = page;
     defer {
         if (target.page_id != page.page_id)
@@ -187,7 +187,7 @@ fn insert_separator(
 /// right: [5, 6, 7]
 pub fn __split_page(self: *Self, page: *PageBuffer, out_separator_key: []u8) !*PageBuffer {
     const new_page_id = try self.page_cache.allocate();
-    const new_page = try self.page_cache.get(new_page_id) orelse @panic("unreachable");
+    const new_page = try self.page_cache.get(new_page_id);
     new_page.header().* = .empty(page.header().type);
     new_page.header().right_pointer = page.header().right_pointer;
     const split_index = page.pointers().len / 2;
@@ -300,12 +300,12 @@ pub fn split_page(
     const parent_id = parent_id: {
         if (path.items.len != 0) break :parent_id path.items[path.items.len - 1];
         const new_root_id = try self.page_cache.allocate();
-        var new_root = (try self.page_cache.get(new_root_id)).?;
+        var new_root = try self.page_cache.get(new_root_id);
         defer self.page_cache.put(new_root);
         new_root.header().* = .empty(.internal);
         self.root_page_id = new_root.page_id;
 
-        const meta_page = (try self.page_cache.get(0)).?;
+        const meta_page = try self.page_cache.get(0);
         defer self.page_cache.put(meta_page);
         meta_page.meta().root_page_id = new_root.page_id;
 

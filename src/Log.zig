@@ -76,7 +76,7 @@ pub fn recover_full_page(self: *Log, raw_buf: []u8) !void {
     const logged_page = raw_buf[8..];
     // TODO: if it fails with IncompletePage then we should still write the page and not fail
     // because it's the job of the WAL to recover it.
-    const page_frame = try self.page_cache.get(page_id) orelse @panic("WAL references an unknown page");
+    const page_frame = try self.page_cache.get(page_id);
     defer self.page_cache.put(page_frame);
 
     @memcpy(page_frame.inner, logged_page);
