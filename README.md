@@ -35,5 +35,5 @@ db
 
 
 # Plan
-[ ] Concurrency
-[ ] Finish WAL
+- [ ] Concurrency
+- [ ] Finish WAL
