@@ -6,6 +6,7 @@ const page = @import("page.zig");
 const page_tests = @import("page_tests.zig");
 const PageCache = @import("PageCache.zig");
 const BTree = @import("BTree.zig");
+const Database = @import("Database.zig");
 const Session = @import("Session.zig");
 const Wal = @import("Wal.zig");
 
@@ -22,7 +23,10 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const cwd = std.Io.Dir.cwd();
 
-    var session = try Session.open(init.io, gpa, cwd, "db.z");
+    const db = try Database.open(init.io, gpa, cwd, "db.z");
+    defer db.deinit();
+
+    var session = Session.open(db, gpa);
     defer session.deinit();
 
     try session.insert("abc", "123");
@@ -40,6 +44,7 @@ test {
     std.testing.refAllDecls(page_tests);
     std.testing.refAllDecls(PageCache);
     std.testing.refAllDecls(BTree);
+    std.testing.refAllDecls(Database);
     std.testing.refAllDecls(Session);
     std.testing.refAllDecls(Wal);
 }

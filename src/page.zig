@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const testing = std.testing;
 const config = @import("config");
 const PageCache = @import("PageCache.zig");
+const Log = @import("Log.zig");
 
 const Io = std.Io;
 const mem = std.mem;
@@ -16,6 +17,17 @@ pub const max_record_size: u32 = page_size / 3;
 // a pointer in the pointers directory in a slotted page
 pub const CellOffset = u64;
 pub const PageId = u64;
+
+/// Database metadata at page zero.
+pub const MetaPage = extern struct {
+    magic: u32 = page_magic,
+    root_page_id: PageId = 1,
+    next_free_page_id: PageId = 1,
+
+    comptime {
+        assert(@sizeOf(MetaPage) <= page_size);
+    }
+};
 
 /// In-memory representation of a slotted page.
 /// ------------------------------
@@ -42,8 +54,20 @@ pub const PageHeader = extern struct {
     type: Type,
     right_pointer: PageId,
 
+    /// The LSN of the log that last touched this page
+    lsn: Log.LSN,
+
     pub fn empty(of_type: Type) Self {
-        return .{ .magic = page_magic, .lower = @sizeOf(Self), .upper = page_size, .number_of_cells = 0, .free_bytes = 0, .type = of_type, .right_pointer = 0 };
+        return .{
+            .magic = page_magic,
+            .lower = @sizeOf(Self),
+            .upper = page_size,
+            .number_of_cells = 0,
+            .free_bytes = 0,
+            .type = of_type,
+            .right_pointer = 0,
+            .lsn = 0,
+        };
     }
 
     /// free space in the page for pointers and cells
@@ -146,6 +170,10 @@ pub const PageBuffer = struct {
         return @ptrCast(@alignCast(self.inner.ptr));
     }
 
+    pub inline fn meta(self: *Self) *MetaPage {
+        return @ptrCast(@alignCast(self.inner.ptr));
+    }
+
     pub fn pointers(self: *Self) []CellOffset {
         const end = @sizeOf(CellOffset) * self.header().number_of_cells;
         //std.debug.print("end {d}; cells {d} \n", .{ end, self.header().number_of_cells });
@@ -198,4 +226,3 @@ pub const PageBuffer = struct {
         try writer.print("   inner @ {*}\n", .{self.inner.ptr});
     }
 };
-

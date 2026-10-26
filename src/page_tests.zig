@@ -2,9 +2,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
 
+const stdx = @import("stdx.zig");
 const pagemod = @import("page.zig");
 const PageCache = @import("PageCache.zig");
 const Tree = @import("BTree.zig");
+const Log = @import("Log.zig");
 const PageId = pagemod.PageId;
 const CellOffset = pagemod.CellOffset;
 const PageHeader = pagemod.PageHeader;
@@ -20,11 +22,29 @@ const assert = std.debug.assert;
 
 const test_allocator = std.testing.allocator;
 
+/// Write the meta page (`page 0`)
+fn writeMetaPage(io: Io, file: Io.File, next_free_page_id: PageId) !void {
+    var buf: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
+    @memset(&buf, 0);
+    var page: PageBuffer = .new(&buf, 0);
+    page.meta().* = .{
+        .root_page_id = 1,
+        .next_free_page_id = next_free_page_id,
+    };
+    try file.writePositionalAll(io, &buf, 0);
+}
+
+/// A throwaway WAL for tree tests.
+fn openTestLog(io: Io, dir: Io.Dir, checkpoint: *const Log.LSN, page_cache: *PageCache) !Log {
+    const wal_dir = try dir.createDirPathOpen(io, "wal", .{ .open_options = .{ .iterate = true } });
+    return try Log.open(io, wal_dir, checkpoint, page_cache);
+}
+
 test PageCache {
     const io = std.testing.io;
     const allocator = test_allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = stdx.tmpMemoryDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "file", .{ .read = true });
 
@@ -142,14 +162,14 @@ test "it finds keys in a leaf root node" {
     const io = std.testing.io;
     const allocator = test_allocator;
     const gpa = test_allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = stdx.tmpMemoryDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
     var buf: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
     var test_cell: [48]u8 = undefined;
 
-    var root: PageBuffer = .new(&buf, 0);
+    var root: PageBuffer = .new(&buf, 1);
     root.header().* = .empty(.leaf);
     for ("ABC") |fill| {
         @memset(&test_cell, fill);
@@ -161,10 +181,18 @@ test "it finds keys in a leaf root node" {
         @memcpy(cell.key(), key);
         root.append_cell(&test_cell);
     }
-    try file.writePositionalAll(io, &buf, 0);
+    try file.writePositionalAll(io, &buf, 1 * page_size);
+    try writeMetaPage(io, file, 2);
 
-    var tree: Tree = .load(allocator, io, file);
-    defer tree.deinit();
+    var cache: PageCache = .new(allocator, file, io);
+    defer cache.deinit();
+
+    var checkpoint: Log.LSN = 0;
+    var log = try openTestLog(io, tmp.dir, &checkpoint, &cache);
+    defer log.deinit();
+
+    var tree: Tree = .load(allocator, &cache, &log);
+    log.tree = &tree;
 
     var result = try tree.find("KA");
     try std.testing.expectEqualStrings("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", result.cell.?.val());
@@ -186,25 +214,34 @@ test "it finds keys in a leaf root node" {
 test "insert then find reloaded tree" {
     const io = std.testing.io;
     const allocator = test_allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = stdx.tmpMemoryDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
     var storage: [page_size]u8 align(@alignOf(PageHeader)) = undefined;
 
-    var root: PageBuffer = .new(&storage, 0);
+    var root: PageBuffer = .new(&storage, 1);
     root.header().* = .empty(.leaf);
-    try file.writePositionalAll(io, &storage, 0);
+    try file.writePositionalAll(io, &storage, 1 * page_size);
+    try writeMetaPage(io, file, 2);
 
-    var tree: Tree = .load(allocator, io, file);
-    defer tree.deinit();
+    var cache: PageCache = .new(allocator, file, io);
+    defer cache.deinit();
 
-    try tree.insert("1", "one");
-    try tree.insert("3", "three");
-    try tree.insert("2", "two");
+    var checkpoint: Log.LSN = 0;
+    var log = try openTestLog(io, tmp.dir, &checkpoint, &cache);
+    defer log.deinit();
+
+    var tree: Tree = .load(allocator, &cache, &log);
+    log.tree = &tree;
+
+    try tree.insert("1", "one", .{});
+    try tree.insert("3", "three", .{});
+    try tree.insert("2", "two", .{});
 
     var result = try tree.find("1");
     try std.testing.expectEqualStrings("one", result.cell.?.val());
+    try std.testing.expect(result.page.header().lsn != 0);
     tree.page_cache.put(result.page);
 
     result = try tree.find("2");
@@ -235,12 +272,19 @@ test "insert random keys" {
     defer arena.deinit();
     const arena_allocator = arena.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = stdx.tmpMemoryDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
-    var tree: Tree = try .empty(allocator, io, file);
-    defer tree.deinit();
+    var cache: PageCache = .new(allocator, file, io);
+    defer cache.deinit();
+
+    var checkpoint: Log.LSN = 0;
+    var log = try openTestLog(io, tmp.dir, &checkpoint, &cache);
+    defer log.deinit();
+
+    var tree: Tree = try .empty(allocator, &cache, &log);
+    log.tree = &tree;
 
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     const random = prng.random();
@@ -252,7 +296,7 @@ test "insert random keys" {
         var key: [10]u8 = undefined;
         random.bytes(&key);
         //fillAlphanumericAndUnderscore(random, &key);
-        try tree.insert(&key, "one");
+        try tree.insert(&key, "one", .{});
         try values.put(try arena_allocator.dupe(u8, &key), try arena_allocator.dupe(u8, "one"));
         try expectValidTree(&tree);
     }
@@ -277,12 +321,19 @@ test "test propgating splits" {
     defer arena.deinit();
     const arena_allocator = arena.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = stdx.tmpMemoryDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
-    var tree: Tree = try .empty(allocator, io, file);
-    defer tree.deinit();
+    var cache: PageCache = .new(allocator, file, io);
+    defer cache.deinit();
+
+    var checkpoint: Log.LSN = 0;
+    var log = try openTestLog(io, tmp.dir, &checkpoint, &cache);
+    defer log.deinit();
+
+    var tree: Tree = try .empty(allocator, &cache, &log);
+    log.tree = &tree;
 
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     const random = prng.random();
@@ -295,7 +346,7 @@ test "test propgating splits" {
         var val: [10]u8 = undefined;
         random.bytes(&key);
         random.bytes(&val);
-        try tree.insert(&key, &val);
+        try tree.insert(&key, &val, .{});
         try values.put(try arena_allocator.dupe(u8, &key), try arena_allocator.dupe(u8, &val));
         //try expectValidTree(&tree);
     }
@@ -313,16 +364,16 @@ test "test propgating splits" {
 }
 
 //  fanout = 4
-//                  [7]                         page = 0
+//                  [7]                         page = 1
 //           ____/      \___
 //          /               \
-//      [3,     5]             [9]              page = 1 & 2
+//      [3,     5]             [9]              page = 2 & 3
 //     /    |    \          /       \
-// [1, 2] [3, 4]  [5, 6]  [7, 8]    [9, 10]     page = 3, 4, 5, 6, 7
+// [1, 2] [3, 4]  [5, 6]  [7, 8]    [9, 10]     page = 4, 5, 6, 7, 8
 test "some tree" {
     const io = std.testing.io;
     const allocator = test_allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = stdx.tmpMemoryDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
@@ -330,51 +381,51 @@ test "some tree" {
     var test_cell: [48]u8 = undefined;
 
     // root
-    var temp_page_id: PageId = 1;
+    var temp_page_id: PageId = 2;
     var cell: Cell = .raw(&test_cell);
     cell.from_keyval("7", @ptrCast(&temp_page_id));
-    var page: PageBuffer = .new(&buf, 0);
+    var page: PageBuffer = .new(&buf, 1);
     page.header().* = .empty(.internal);
-    page.header().right_pointer = 2;
+    page.header().right_pointer = 3;
     page.append_cell(&test_cell);
-    try file.writePositionalAll(io, &buf, 0);
+    try file.writePositionalAll(io, &buf, 1 * page_size);
 
     // [3, 5]
     buf = undefined;
-    page = .new(&buf, 1);
+    page = .new(&buf, 2);
     page.header().* = .empty(.internal);
-    page.header().right_pointer = 5;
+    page.header().right_pointer = 6;
 
-    temp_page_id = 3;
+    temp_page_id = 4;
     test_cell = undefined;
     cell = .raw(&test_cell);
     cell.from_keyval("3", @ptrCast(&temp_page_id));
     page.append_cell(&test_cell);
 
-    temp_page_id = 4;
+    temp_page_id = 5;
     test_cell = undefined;
     cell = .raw(&test_cell);
     cell.from_keyval("5", @ptrCast(&temp_page_id));
     page.append_cell(&test_cell);
 
-    try file.writePositionalAll(io, &buf, 1 * page_size);
+    try file.writePositionalAll(io, &buf, 2 * page_size);
 
     // [9]
     buf = undefined;
-    page = .new(&buf, 2);
+    page = .new(&buf, 3);
     page.header().* = .empty(.internal);
-    page.header().right_pointer = 7;
+    page.header().right_pointer = 8;
 
-    temp_page_id = 6;
+    temp_page_id = 7;
     test_cell = undefined;
     cell = .raw(&test_cell);
     cell.from_keyval("9", @ptrCast(&temp_page_id));
     page.append_cell(&test_cell);
-    try file.writePositionalAll(io, &buf, 2 * page_size);
+    try file.writePositionalAll(io, &buf, 3 * page_size);
 
     // [1, 2]
     buf = undefined;
-    page = .new(&buf, 3);
+    page = .new(&buf, 4);
     page.header().* = .empty(.leaf);
 
     test_cell = undefined;
@@ -387,11 +438,11 @@ test "some tree" {
     cell.from_keyval("2", "two");
     page.append_cell(&test_cell);
 
-    try file.writePositionalAll(io, &buf, 3 * page_size);
+    try file.writePositionalAll(io, &buf, 4 * page_size);
 
     // [3, 4]
     buf = undefined;
-    page = .new(&buf, 4);
+    page = .new(&buf, 5);
     page.header().* = .empty(.leaf);
 
     test_cell = undefined;
@@ -404,11 +455,11 @@ test "some tree" {
     cell.from_keyval("4", "four");
     page.append_cell(&test_cell);
 
-    try file.writePositionalAll(io, &buf, 4 * page_size);
+    try file.writePositionalAll(io, &buf, 5 * page_size);
 
     // [5, 6]
     buf = undefined;
-    page = .new(&buf, 5);
+    page = .new(&buf, 6);
     page.header().* = .empty(.leaf);
 
     test_cell = undefined;
@@ -421,11 +472,11 @@ test "some tree" {
     cell.from_keyval("6", "six");
     page.append_cell(&test_cell);
 
-    try file.writePositionalAll(io, &buf, 5 * page_size);
+    try file.writePositionalAll(io, &buf, 6 * page_size);
 
     // [7, 8]
     buf = undefined;
-    page = .new(&buf, 6);
+    page = .new(&buf, 7);
     page.header().* = .empty(.leaf);
 
     test_cell = undefined;
@@ -438,11 +489,11 @@ test "some tree" {
     cell.from_keyval("8", "eight");
     page.append_cell(&test_cell);
 
-    try file.writePositionalAll(io, &buf, 6 * page_size);
+    try file.writePositionalAll(io, &buf, 7 * page_size);
 
     // [9, 10]
     buf = undefined;
-    page = .new(&buf, 7);
+    page = .new(&buf, 8);
     page.header().* = .empty(.leaf);
 
     test_cell = undefined;
@@ -455,10 +506,18 @@ test "some tree" {
     //cell.from_keyval("10", "ten");
     //page.append_cell(&test_cell);
 
-    try file.writePositionalAll(io, &buf, 7 * page_size);
+    try file.writePositionalAll(io, &buf, 8 * page_size);
+    try writeMetaPage(io, file, 9);
 
-    var tree: Tree = .load(allocator, io, file);
-    defer tree.deinit();
+    var cache: PageCache = .new(allocator, file, io);
+    defer cache.deinit();
+
+    var checkpoint: Log.LSN = 0;
+    var log = try openTestLog(io, tmp.dir, &checkpoint, &cache);
+    defer log.deinit();
+
+    var tree: Tree = .load(allocator, &cache, &log);
+    log.tree = &tree;
 
     try expectValidTree(&tree);
 
@@ -502,19 +561,26 @@ test "insert keys in ascending order" {
     const io = std.testing.io;
     const allocator = test_allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = stdx.tmpMemoryDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
-    var tree: Tree = try .empty(allocator, io, file);
-    defer tree.deinit();
+    var cache: PageCache = .new(allocator, file, io);
+    defer cache.deinit();
+
+    var checkpoint: Log.LSN = 0;
+    var log = try openTestLog(io, tmp.dir, &checkpoint, &cache);
+    defer log.deinit();
+
+    var tree: Tree = try .empty(allocator, &cache, &log);
+    log.tree = &tree;
 
     var key: [1000]u8 = @splat(0);
     var value: [700]u8 = @splat('v');
 
     for (0..10) |i| {
         _ = try fmt.bufPrint(key[0..20], "{d:0>20}", .{i});
-        try tree.insert(&key, &value);
+        try tree.insert(&key, &value, .{});
     }
     try expectValidTree(&tree);
 }
@@ -524,12 +590,19 @@ test "insert keys in descending order" {
     const io = std.testing.io;
     const allocator = test_allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = stdx.tmpMemoryDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "b.tree", .{ .read = true });
 
-    var tree: Tree = try .empty(allocator, io, file);
-    defer tree.deinit();
+    var cache: PageCache = .new(allocator, file, io);
+    defer cache.deinit();
+
+    var checkpoint: Log.LSN = 0;
+    var log = try openTestLog(io, tmp.dir, &checkpoint, &cache);
+    defer log.deinit();
+
+    var tree: Tree = try .empty(allocator, &cache, &log);
+    log.tree = &tree;
 
     var key: [1000]u8 = @splat(0);
     var value: [700]u8 = @splat('v');
@@ -538,7 +611,7 @@ test "insert keys in descending order" {
     while (i > 0) {
         i -= 1;
         _ = try fmt.bufPrint(key[0..20], "{d:0>20}", .{i});
-        try tree.insert(&key, &value);
+        try tree.insert(&key, &value, .{});
     }
     try expectValidTree(&tree);
 }

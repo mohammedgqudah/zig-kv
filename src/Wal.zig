@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const stdx = @import("stdx.zig");
+const pagemod = @import("page.zig");
 
 const mem = std.mem;
 const Io = std.Io;
@@ -39,7 +40,7 @@ mode: Mode,
 
 /// Log Sequence Number (LSN).
 /// Internally, it represents a byte-offset in the WAL.
-const LSN = u64;
+pub const LSN = u64;
 const SegmentIdx = u64;
 
 const Mode = enum { recovery, append };
@@ -66,10 +67,11 @@ const max_record_size =
     if (!builtin.is_test)
         1 * 1024 * 1024 * 1024
     else
-        500;
+        pagemod.page_size * 2;
 
 comptime {
     assert(default_segment_size % 8 == 0);
+    assert(max_record_size > pagemod.page_size);
 }
 
 /// Align `len` to multiple of 8
@@ -194,9 +196,8 @@ pub fn append(self: *Self, bytes: []const u8) !LSN {
         };
     }
 
-    const lsn = self.lsn;
     self.lsn += reserve;
-    return lsn;
+    return self.lsn;
 }
 
 /// Create the next segment if we reached the end of the current segment
@@ -216,6 +217,7 @@ fn createSegment(io: Io, dir: Io.Dir, idx: SegmentIdx) !Io.File {
 
 const Record = struct {
     buffer: []u8,
+    lsn: LSN,
 
     pub fn deinit(self: @This(), allocator: mem.Allocator) void {
         allocator.free(self.buffer);
@@ -320,6 +322,7 @@ pub fn next(self: *@This(), allocator: mem.Allocator) WalRecoveryError!?Record {
 
     return .{
         .buffer = buf,
+        .lsn = self.lsn,
     };
 }
 
@@ -334,15 +337,16 @@ inline fn idxToSegmentName(index: LSN) [segment_name_len]u8 {
 test "append and iterate" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = stdx.tmpMemoryDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.open(io, tmp.dir, null);
     const first_lsn = try wal.append("inc 5");
     const second_lsn = try wal.append("inc 3");
 
-    try std.testing.expectEqual(0, first_lsn);
-    try std.testing.expect(second_lsn > first_lsn);
+    // The LSN is the end of the record: header (16) + payload, aligned to 8.
+    try std.testing.expectEqual(@as(LSN, 24), first_lsn);
+    try std.testing.expectEqual(@as(LSN, 48), second_lsn);
 
     wal.deinit();
     wal = try Self.open(io, tmp.dir, null);
@@ -358,10 +362,42 @@ test "append and iterate" {
     try std.testing.expectEqual(null, try wal.next(allocator));
 }
 
+test "LSN is the end position of a record" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = stdx.tmpMemoryDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
+
+    // 16-byte header + 4-byte payload = 24 bytes.
+    const first_lsn = try wal.append("test");
+    try std.testing.expectEqual(@as(LSN, 24), first_lsn);
+
+    // A record that crosses a segment boundary still returns its logical end offset.
+    const filler: [40]u8 = @splat(0);
+    try std.testing.expectEqual(@as(LSN, 80), try wal.append(&filler));
+    try std.testing.expectEqual(@as(LSN, 104), try wal.append("foobar"));
+
+    // The returned LSN is exactly the current end of the WAL.
+    try std.testing.expectEqual(wal.lsn, 104);
+
+    wal.deinit();
+
+    // Resuming from a record's LSN skips that record: it is the end of the record,
+    // not its beginning.
+    wal = try Self.openWithSegmentSize(io, tmp.dir, 64, first_lsn);
+    defer wal.deinit();
+
+    const entry = try wal.next(allocator);
+    defer entry.?.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, &filler, entry.?.buffer);
+}
+
 test "iter detects corruption of an entry" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = stdx.tmpMemoryDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.open(io, tmp.dir, null);
@@ -380,7 +416,7 @@ test "iter detects corruption of an entry" {
 test "iter rejects a length that overflows the log" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = stdx.tmpMemoryDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.open(io, tmp.dir, null);
@@ -399,18 +435,18 @@ test "iter rejects a length that overflows the log" {
 test "append a record that crosses a segment boundary" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = stdx.tmpMemoryDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
     defer wal.deinit();
 
     const filler: [40]u8 = @splat(0);
-    _ = try wal.append(&filler);
+    try std.testing.expectEqual(@as(LSN, 56), try wal.append(&filler));
 
     // only 8 bytes are available in the segment now
-    _ = try wal.append("test");
-    _ = try wal.append("foobar");
+    try std.testing.expectEqual(@as(LSN, 80), try wal.append("test"));
+    try std.testing.expectEqual(@as(LSN, 104), try wal.append("foobar"));
 
     wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
 
@@ -437,7 +473,7 @@ test "append a record that crosses a segment boundary" {
 test "recovery continues past a record ending exactly at a segment boundary" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = stdx.tmpMemoryDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
@@ -466,7 +502,7 @@ test "recovery continues past a record ending exactly at a segment boundary" {
 test "append across three segments recovers all records" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = stdx.tmpMemoryDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
@@ -502,7 +538,7 @@ test "append across three segments recovers all records" {
 test "detect a truncated record" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = stdx.tmpMemoryDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.open(io, tmp.dir, null);
@@ -521,7 +557,7 @@ test "detect a truncated record" {
 
 test "reject checkpoint if WAL did not exist" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = stdx.tmpMemoryDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     const checkpoint = 5;
@@ -531,7 +567,7 @@ test "reject checkpoint if WAL did not exist" {
 
 test "reject checkpoint beyond wal" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = stdx.tmpMemoryDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.openWithSegmentSize(io, tmp.dir, 64, null);
@@ -552,7 +588,7 @@ test "reject checkpoint beyond wal" {
 
 test "reject records exceeding max size" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = stdx.tmpMemoryDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var wal = try Self.open(io, tmp.dir, null);

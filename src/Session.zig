@@ -1,63 +1,35 @@
 const std = @import("std");
 
-const BTree = @import("BTree.zig");
+const stdx = @import("stdx.zig");
+const Database = @import("Database.zig");
+const pagemod = @import("page.zig");
 
-const Io = std.Io;
+const mem = std.mem;
 
-/// A `Session` is a connection to an open database file.
+/// A `Session` is a handle to an open database.
 const Self = @This();
 
-io: Io,
-gpa: std.mem.Allocator,
-db_file: Io.File,
-tree: BTree,
+db: *Database,
+gpa: mem.Allocator,
 
-/// Open the database at `path`.
-/// A new database is initialized If `path` doesn't exist.
-pub fn open(
-    io: Io,
-    gpa: std.mem.Allocator,
-    cwd: Io.Dir,
-    path: []const u8,
-) !Self {
-    var initialize = false;
-    const file = cwd.openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
-        error.FileNotFound => blk: {
-            initialize = true;
-            break :blk try cwd.createFile(io, path, .{ .read = true });
-        },
-        else => return err,
-    };
-    errdefer file.close(io);
-
-    const tree = if (initialize)
-        try BTree.empty(gpa, io, file)
-    else
-        BTree.load(gpa, io, file);
-
-    return .{
-        .io = io,
-        .gpa = gpa,
-        .db_file = file,
-        .tree = tree,
-    };
+pub fn open(db: *Database, gpa: mem.Allocator) Self {
+    return .{ .db = db, .gpa = gpa };
 }
 
 pub fn deinit(self: *Self) void {
-    self.tree.deinit();
-    self.db_file.close(self.io);
+    _ = self;
 }
 
 pub fn insert(self: *Self, key: []const u8, value: []const u8) !void {
-    try self.tree.insert(key, value);
+    try self.db.tree.insert(key, value, .{});
 }
 
 /// Look up `key` and return a copy of its value, or `null` when it's not found.
 ///
 /// The caller owns the returned slice.
 pub fn find(self: *Self, key: []const u8) !?[]u8 {
-    const result = try self.tree.find(key);
-    defer self.tree.page_cache.put(result.page);
+    const result = try self.db.tree.find(key);
+    defer self.db.page_cache.put(result.page);
 
     var cell = result.cell orelse return null;
     return try self.gpa.dupe(u8, cell.val());
@@ -66,10 +38,13 @@ pub fn find(self: *Self, key: []const u8) !?[]u8 {
 const testing = std.testing;
 
 test "insert then find a key" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = stdx.tmpMemoryDir(.{});
     defer tmp.cleanup();
 
-    var session = try Self.open(testing.io, testing.allocator, tmp.dir, "db");
+    const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+    defer db.deinit();
+
+    var session = Self.open(db, testing.allocator);
     defer session.deinit();
 
     try session.insert("abc", "123");
@@ -82,20 +57,102 @@ test "insert then find a key" {
 }
 
 test "keys survive reopening the database" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = stdx.tmpMemoryDir(.{});
     defer tmp.cleanup();
 
     {
-        var session = try Self.open(testing.io, testing.allocator, tmp.dir, "db");
+        const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+        defer db.deinit();
+
+        var session = Self.open(db, testing.allocator);
         defer session.deinit();
         try session.insert("abc", "123");
         try session.insert("hello", "world");
     }
 
-    var session = try Self.open(testing.io, testing.allocator, tmp.dir, "db");
+    const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+    defer db.deinit();
+
+    var session = Self.open(db, testing.allocator);
     defer session.deinit();
 
     const value = try session.find("hello") orelse return error.KeyMissing;
     defer testing.allocator.free(value);
     try testing.expectEqualStrings("world", value);
+}
+
+// TODO: page-oriented logging
+//test "WAL recovers inserts" {
+//    var tmp = stdx.tmpMemoryDir(.{});
+//    defer tmp.cleanup();
+//
+//    {
+//        const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+//
+//        var session = Self.open(db, testing.allocator);
+//        try session.insert("abc", "123");
+//
+//        session.deinit();
+//        db.deinit();
+//
+//        const data_dir = try tmp.dir.openDir(testing.io, "db", .{});
+//        defer data_dir.close(testing.io);
+//
+//        const index_file = try data_dir.openFile(testing.io, "index", .{ .mode = .read_write });
+//        defer index_file.close(testing.io);
+//
+//        // XXX: simulate the system crashing before persisting the page.
+//        const fill: pagemod.PageHeader = .empty(.leaf);
+//        try index_file.writePositionalAll(testing.io, @ptrCast(&fill), 0);
+//    }
+//
+//    const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+//    defer db.deinit();
+//
+//    var session = Self.open(db, testing.allocator);
+//    defer session.deinit();
+//
+//    const result = try session.db.tree.find("abc");
+//    defer session.db.page_cache.put(result.page);
+//
+//    var cell = result.cell orelse return error.KeyMissing;
+//    try testing.expectEqualStrings("123", cell.val());
+//
+//    // assert that recovery updates the LSN too
+//    try testing.expect(result.page.header().lsn != 0);
+//}
+
+test "reopening a database that spans multiple pages" {
+    var tmp = stdx.tmpMemoryDir(.{});
+    defer tmp.cleanup();
+
+    var value: [1000]u8 = @splat('v');
+    var key_buf: [16]u8 = undefined;
+
+    // Enough rows to split the root page and allocate new pages.
+    {
+        const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+        defer db.deinit();
+
+        var session = Self.open(db, testing.allocator);
+        defer session.deinit();
+
+        for (0..10) |i| {
+            const key = try std.fmt.bufPrint(&key_buf, "key{d}", .{i});
+            try session.insert(key, &value);
+        }
+    }
+
+    const db = try Database.open(testing.io, testing.allocator, tmp.dir, "db");
+    defer db.deinit();
+
+    var session = Self.open(db, testing.allocator);
+    defer session.deinit();
+
+    for (0..10) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "key{d}", .{i});
+        const found = try session.find(key) orelse return error.KeyMissing;
+        defer testing.allocator.free(found);
+        try testing.expectEqualStrings(&value, found);
+    }
 }

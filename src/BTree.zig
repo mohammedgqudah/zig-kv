@@ -2,6 +2,7 @@ const std = @import("std");
 
 const pagemod = @import("page.zig");
 const PageCache = @import("PageCache.zig");
+const Log = @import("Log.zig");
 const Cell = pagemod.Cell;
 const CellOffset = pagemod.CellOffset;
 const PageBuffer = pagemod.PageBuffer;
@@ -15,7 +16,7 @@ const mem = std.mem;
 pub const Error = mem.Allocator.Error ||
     Io.File.ReadPositionalError ||
     Io.File.WritePositionalError ||
-    error{IncompletePage};
+    error{IncompletePage, InvalidPageMagic};
 
 /// A B+tree
 const Self = @This();
@@ -28,15 +29,19 @@ pub const FindResult = struct {
     page: *PageBuffer,
 };
 
-io: Io,
-file: Io.File,
-root_page_id: u64 = 0,
-page_cache: PageCache,
+root_page_id: u64,
+page_cache: *PageCache,
+log: *Log,
 allocator: mem.Allocator,
 
-/// initialize a new tree, `file` is expected to be empty.
-pub fn empty(allocator: mem.Allocator, io: Io, file: Io.File) !Self {
-    var tree: Self = .load(allocator, io, file);
+/// initialize a new tree on top of an empty database file.
+pub fn empty(allocator: mem.Allocator, page_cache: *PageCache, log: *Log) !Self {
+    var tree: Self = .{
+        .page_cache = page_cache,
+        .log = log,
+        .allocator = allocator,
+        .root_page_id = 1,
+    };
     const root_id = try tree.page_cache.allocate();
     tree.root_page_id = root_id;
 
@@ -46,15 +51,27 @@ pub fn empty(allocator: mem.Allocator, io: Io, file: Io.File) !Self {
     root_page.header().* = .empty(.leaf);
     tree.page_cache.mark_page_dirty(root_page);
 
+    const meta_page = (try tree.page_cache.get(0)).?;
+    defer tree.page_cache.put(meta_page);
+    meta_page.meta().root_page_id = root_id;
+
     return tree;
 }
 
-pub fn load(allocator: mem.Allocator, io: Io, file: Io.File) Self {
+pub fn load(allocator: mem.Allocator, page_cache: *PageCache, log: *Log) Self {
+    const meta_page = page_cache.get(0) catch {
+        @panic("OOM");
+    } orelse unreachable;
+    defer page_cache.put(meta_page);
+
+    const meta = meta_page.meta();
+    page_cache.free_page_id = meta.next_free_page_id;
+
     return .{
-        .io = io,
-        .file = file,
-        .page_cache = .new(allocator, file, io),
+        .page_cache = page_cache,
+        .log = log,
         .allocator = allocator,
+        .root_page_id = meta.root_page_id,
     };
 }
 
@@ -287,6 +304,12 @@ pub fn split_page(
         defer self.page_cache.put(new_root);
         new_root.header().* = .empty(.internal);
         self.root_page_id = new_root.page_id;
+
+        const meta_page = (try self.page_cache.get(0)).?;
+        defer self.page_cache.put(meta_page);
+        meta_page.meta().root_page_id = new_root.page_id;
+
+
         break :parent_id new_root_id;
     };
     try self.insert_separator(
@@ -333,17 +356,26 @@ fn hasRoom(page: *PageBuffer, key: []const u8, value: []const u8) bool {
     return page.header().freeSpace() >= needed_size;
 }
 
+pub const InsertOptions = struct {
+    /// The LSN of the WAL record being replayed, if this
+    /// insert is part of recovery. Leave it null for regular inserts.
+    ///
+    /// When set, the insert will not log the operation again.
+    recovery_lsn: ?Log.LSN = null,
+};
+
 pub fn insert(
     self: *Self,
     key: []const u8,
     value: []const u8,
+    options: InsertOptions,
 ) !void {
     var path: Path = .empty;
     const page = try self.descend(key, &path);
     var target = page;
     defer {
         // release the leaf page that was modified. If the page was split
-        // then we need to release the original and the new page as well. 
+        // then we need to release the original and the new page as well.
         if (target.page_id != page.page_id) self.page_cache.put(target);
         self.page_cache.put(page);
         path.deinit(self.allocator);
@@ -352,9 +384,24 @@ pub fn insert(
     var insert_idx = upperBound(page, key);
     if (lookupCell(page, key, insert_idx) != null) return error.KeyAlreadyExists;
 
+    // TODO: logging should happen after the insert has finished,
+    //      just in case the insert fails. I also need to ensure that even when the insert fails I don't leave
+    //      pages in an inconsistent state: maybe make functions that
+    //      modify pages infallible (e.g. writeCell) or use CoW.
+    // but right now an insert can only fail if the page cache is unable to allocate a new page
+    // or `get` a page.
+    if (options.recovery_lsn) |lsn| {
+        // we are in recovery, set the redo record LSN.
+        page.header().lsn = lsn;
+    } else {
+        const lsn = try self.log.log_insert(self.allocator, key, value, page);
+        page.header().lsn = lsn;
+    }
+
     if (hasRoom(page, key, value)) {
         writeCell(target, insert_idx, key, value);
     } else {
+        // TODO: log splits
         const result = try self.split_page(page, &path, insert_idx, key);
         target = result.target_page;
         insert_idx = result.insert_idx;
@@ -362,8 +409,4 @@ pub fn insert(
     }
 
     self.page_cache.mark_page_dirty(target);
-}
-
-pub fn deinit(self: *Self) void {
-    self.page_cache.deinit();
 }

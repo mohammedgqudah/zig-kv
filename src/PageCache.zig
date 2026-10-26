@@ -18,8 +18,9 @@ cache: std.AutoHashMap(PageId, *PageBuffer),
 allocator: mem.Allocator,
 file: Io.File,
 io: Io,
-// TODO: this is temporary. We should track free blocks some other way.
-free_page_id: PageId = 0,
+/// Starts at page `1` because the first page `0`
+/// is a special page for the tree.
+free_page_id: PageId = 1,
 
 pub fn new(allocator: mem.Allocator, file: Io.File, io: Io) Self {
     return .{
@@ -50,6 +51,8 @@ fn load_page(self: *Self, id: PageId) !*PageBuffer {
     }
 
     page.* = .new(page_buf, id);
+    //if (page.header().magic != pagemod.page_magic)
+    //    return error.InvalidPageMagic;
     return page;
 }
 
@@ -65,16 +68,18 @@ inline fn writeback_page(self: *Self, page: *PageBuffer) void {
     page.is_dirty = false;
 }
 
-/// TODO: i'm not sure if this is the right API and if it belongs in PageCache
-/// TODO: why even accept a page id? shouldn't we track the next free page id and return it?
+/// Allocate a new page and return its ID.
 pub fn allocate(self: *Self) !PageId {
     const id = self.free_page_id;
-    self.free_page_id += 1;
-    errdefer self.free_page_id -= 1;
 
     const page_buf: [page_size]u8 = undefined;
     _ = try self.file.writePositionalAll(self.io, &page_buf, id * page_size);
-    // TOOD: should allocating also cache the page?
+    self.free_page_id += 1;
+
+    const meta_page = try self.get(0);
+    defer self.put(meta_page.?);
+    meta_page.?.meta().next_free_page_id = self.free_page_id;
+
     return id;
 }
 
@@ -88,6 +93,7 @@ pub fn allocate(self: *Self) !PageId {
 /// defer page_cache.put(page);
 /// // modify the page
 /// ```
+/// TODO: return cannot be null, change type.
 pub fn get(self: *Self, id: PageId) !?*PageBuffer {
     const result = try self.cache.getOrPut(id);
 

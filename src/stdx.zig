@@ -264,7 +264,7 @@ test "IoVecCursor fills mutable buffers across budgets and short reads" {
     try std.testing.expectEqual(3, first[0].len);
     try std.testing.expectEqual(2, first[1].len);
 
-    // Short read: only 4 bytes were read. 
+    // Short read: only 4 bytes were read.
     // simulate a short-read from a file:
     var got: usize = 4;
     for (first) |dst| {
@@ -293,4 +293,46 @@ test "IoVecCursor fills mutable buffers across budgets and short reads" {
     try std.testing.expectEqualStrings("abc", &a_buf);
     try std.testing.expectEqualStrings("defg", &b_buf);
     try std.testing.expectEqualStrings("h", &c_buf);
+}
+
+pub const TmpMemoryDir = struct {
+    dir: std.Io.Dir,
+    parent_dir: std.Io.Dir,
+    sub_path: [sub_path_len]u8,
+
+    const random_bytes_count = 12;
+    const sub_path_len = std.base64.url_safe.Encoder.calcSize(random_bytes_count);
+
+    pub fn cleanup(self: *TmpMemoryDir) void {
+        const testing = std.testing;
+        self.dir.close(testing.io);
+        self.parent_dir.deleteTree(testing.io, &self.sub_path) catch {};
+        self.parent_dir.close(testing.io);
+    }
+};
+
+/// Create a test-only temporary directory under (`/tmp`) instead of `.zig-cache/tmp`.
+///
+/// Use this for tests that do not need to pay the cost of an fsync, since it's a no-op on tmpfs.
+pub fn tmpMemoryDir(opts: std.Io.Dir.OpenOptions) TmpMemoryDir {
+    comptime if (!builtin.is_test) {
+        @compileError("cannot use tmpMemoryDir outside of tests");
+    };
+    const testing = std.testing;
+
+    var random_bytes: [TmpMemoryDir.random_bytes_count]u8 = undefined;
+    testing.io.random(&random_bytes);
+    var sub_path: [TmpMemoryDir.sub_path_len]u8 = undefined;
+    _ = std.base64.url_safe.Encoder.encode(&sub_path, &random_bytes);
+
+    const parent_dir = std.Io.Dir.openDirAbsolute(testing.io, "/tmp", .{}) catch
+        @panic("unable to open /tmp");
+    const dir = parent_dir.createDirPathOpen(testing.io, &sub_path, .{ .open_options = opts }) catch
+        @panic("unable to create the tmp dir");
+
+    return .{
+        .dir = dir,
+        .parent_dir = parent_dir,
+        .sub_path = sub_path,
+    };
 }
