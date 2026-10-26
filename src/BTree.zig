@@ -1,3 +1,11 @@
+//! An on-disk B+tree.
+//!
+//! Nodes are slotted pages, see `PageHeader`.
+//! Page zero is the `MetaPage` and holds the root page id.
+//!
+//! Every `*PageFrame` returned by the tree is pinned in the buffer manager and
+//! the caller has to `put` the page back.
+
 const std = @import("std");
 
 const pagemod = @import("page.zig");
@@ -7,6 +15,7 @@ const Cell = pagemod.Cell;
 const CellOffset = pagemod.CellOffset;
 const PageFrame = pagemod.PageFrame;
 const PageHeader = pagemod.PageHeader;
+const MetaPage = pagemod.MetaPage;
 const PageId = pagemod.PageId;
 const page_size = pagemod.page_size;
 const Io = std.Io;
@@ -16,15 +25,15 @@ const mem = std.mem;
 pub const Error = mem.Allocator.Error ||
     Io.File.ReadPositionalError ||
     Io.File.WritePositionalError ||
-    error{IncompletePage, InvalidPageMagic};
+    error{ IncompletePage, InvalidPageMagic };
 
-/// A B+tree
 const Self = @This();
 
 /// The result returned by a btree lookup.
 /// Lookup will stop when a leaf node is found and optionally the key is found.
 pub const FindResult = struct {
-    /// The lifetime of the cell is tied to the page buffer
+    /// The lifetime of the cell is tied to the page frame, which stays pinned
+    /// until the caller `put`s it back.
     cell: ?Cell,
     page: *PageFrame,
 };
@@ -36,18 +45,19 @@ allocator: mem.Allocator,
 
 /// initialize a new tree on top of an empty database file.
 pub fn empty(allocator: mem.Allocator, buffer_manager: *BufferManager, log: *Log) !Self {
+    const root_id = try buffer_manager.allocate();
     var tree: Self = .{
         .buffer_manager = buffer_manager,
         .log = log,
         .allocator = allocator,
-        .root_page_id = 1,
+        .root_page_id = root_id,
     };
-    const root_id = try tree.buffer_manager.allocate();
-    tree.root_page_id = root_id;
 
     var root_page = try tree.buffer_manager.get(root_id);
     defer tree.buffer_manager.put(root_page);
 
+    // the root node starts as a leaf node
+    // until the first split.
     root_page.header().* = .empty(.leaf);
     tree.buffer_manager.mark_page_dirty(root_page);
 
@@ -58,6 +68,7 @@ pub fn empty(allocator: mem.Allocator, buffer_manager: *BufferManager, log: *Log
     return tree;
 }
 
+/// Load an existing tree from disk.
 pub fn load(allocator: mem.Allocator, buffer_manager: *BufferManager, log: *Log) Self {
     const meta_page = buffer_manager.get(0) catch {
         @panic("OOM");
@@ -93,9 +104,13 @@ fn upperBound(page: *PageFrame, key: []const u8) usize {
     return low;
 }
 
+/// Page ids that were visited while descending the tree. This path
+/// is followed when separator keys are inserted.
 const Path = std.ArrayList(PageId);
 
-/// Return the child (page_id) a cell is pointing to.
+/// Return the child Page ID an internal cell (a separator) is pointing to.
+///
+/// The last separator (N+1) is stored in `right_pointer`.
 fn childAt(page: *PageFrame, index: usize) PageId {
     std.debug.assert(page.header().type == .internal);
     if (index == page.pointers().len) return page.header().right_pointer;
@@ -103,7 +118,9 @@ fn childAt(page: *PageFrame, index: usize) PageId {
     return mem.readInt(PageId, @ptrCast(cell.val()), .little);
 }
 
-/// Descend the tree until a leaf that might hold `key` is found.
+/// Descend the tree until a leaf that **might** hold `key` is found.
+///
+/// The returned page is pinned and the caller owns it.
 fn descend(self: *Self, key: []const u8, path: ?*Path) Error!*PageFrame {
     var page_id = self.root_page_id;
     while (true) {
@@ -308,7 +325,6 @@ pub fn split_page(
         const meta_page = try self.buffer_manager.get(0);
         defer self.buffer_manager.put(meta_page);
         meta_page.meta().root_page_id = new_root.page_id;
-
 
         break :parent_id new_root_id;
     };

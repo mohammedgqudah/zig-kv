@@ -74,6 +74,21 @@ pub fn build(b: *std.Build) void {
     lldb_cmd.addPassthruArgs();
     debug_step.dependOn(&lldb_cmd.step);
 
+    // docs
+    const docs_step = b.step("docs", "Generate html docs into zig-out/docs");
+    const docs_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+    });
+    docs_mod.addOptions("config", options);
+    const docs = b.addObject(.{ .name = "zig_simple_kv", .root_module = docs_mod });
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = docs.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    docs_step.dependOn(&install_docs.step);
+
     // coverage
     const coverage_step = b.step("coverage", "Run the test artifact under kcov, writing a report to kcov-out");
     const kcov_cmd = b.addSystemCommand(&.{ "kcov", "--include-pattern=src", "kcov-out" });

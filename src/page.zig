@@ -30,6 +30,7 @@ pub const MetaPage = extern struct {
 };
 
 /// In-memory representation of a slotted page.
+/// ```
 /// ------------------------------
 /// |p| |p| |p| <- lower
 ///
@@ -39,6 +40,7 @@ pub const MetaPage = extern struct {
 ///                  upper->  | cell
 ///    | |      cell      | | cell |
 /// -------------------------------
+/// ```
 pub const PageHeader = extern struct {
     const Self = @This();
     pub const Type = enum(u32) { internal, leaf };
